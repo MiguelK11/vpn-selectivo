@@ -25,7 +25,7 @@ li { margin:4px 0; }
 
 <h2>Daily use</h2>
 <div class="card"><ul>
-<li>Open <b>VPN Selectivo</b> from the Dock: VPN switch, live status (server and exit IP), location (<i>Ubicación</i>), <b>Auto-VPN</b> and the list of apps to check (through Mullvad) or uncheck (normal connection). No password needed.</li>
+<li>Open <b>VPN Selectivo</b> from the Dock: VPN switch, live status (server and exit IP), location, <b>Auto-VPN</b> and the list of apps to check (through Mullvad) or uncheck (normal connection). No password needed.</li>
 <li><b>Auto-VPN</b> (⚡): opening an app with ⚡ turns the VPN on; it turns off 2 minutes after they are all closed. Checked apps without ⚡ only have Internet access while the VPN is on.</li>
 <li>You can also open apps with their <b>"‹App› VPN"</b> launchers (folder <code>/Applications/VPN Selectivo</code>; drag them to the Dock) or from the menu-bar shield.</li>
 <li>If you open a protected app with its original icon, it is closed instantly and reopened protected (Chromium browsers restore their tabs).</li>
@@ -42,14 +42,15 @@ li { margin:4px 0; }
 <tr><td>Triangle</td><td>The service is not responding. Check the log or reinstall.</td></tr>
 </table></div>
 
-<h2>Buttons (the interface is in Spanish)</h2>
+<h2>Buttons</h2>
 <div class="card"><ul>
-<li><b>Comprobar IP</b> (check IP): compares the exit IP of protected apps (Mullvad) with your direct IP.</li>
-<li><b>Autodiagnóstico</b> (self-test): PF, tunnel, IPs, IPv6, UDP and a deliberate tunnel drop (about 30 s).</li>
-<li><b>Vigilar fugas</b> (watch for leaks): with protected apps open, looks for their packets (or packets sent by system services on their behalf) outside the tunnel.</li>
-<li><b>Importar configuración</b> (import configuration): a <code>.conf</code> or <code>.zip</code> from mullvad.net › WireGuard configuration (asks for the administrator password).</li>
-<li><b>Registro</b> (log): opens <code>/Library/Logs/VPNSelectivo.log</code>.</li>
-<li>When you check or uncheck an app that is running: <b>Reiniciar ahora</b> (restart now: quits cleanly and reopens it in/out of the tunnel) or <b>Al cerrarla</b> (when I close it).</li>
+<li><b>Check IP</b>: compares the exit IP of protected apps (Mullvad) with your direct IP.</li>
+<li><b>Self-Test</b>: PF, tunnel, IPs, IPv6, UDP and a deliberate tunnel drop (about 30 s).</li>
+<li><b>Watch for Leaks</b>: with protected apps open, looks for their packets (or packets sent by system services on their behalf) outside the tunnel.</li>
+<li><b>Import Configuration…</b>: a <code>.conf</code> or <code>.zip</code> from mullvad.net › WireGuard configuration (asks for the administrator password).</li>
+<li><b>Log</b>: opens <code>/Library/Logs/VPNSelectivo.log</code>.</li>
+<li>When you check or uncheck an app that is running: <b>Restart Now</b> (quits cleanly and reopens it in/out of the tunnel) or <b>When I Quit It</b>.</li>
+<li>Language: the app follows your Mac's language (English or Spanish). To choose one for this app only: System Settings › General › Language &amp; Region › Applications.</li>
 </ul></div>
 
 <h2>Important</h2>

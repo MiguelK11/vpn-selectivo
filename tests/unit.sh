@@ -10,7 +10,7 @@ trap 'rm -rf "$T"' EXIT
 WGBIN="${1:-$KIT/build/bin/wg}"
 fails=0; n=0
 ok()  { n=$((n + 1)); echo "ok    $*"; }
-bad() { n=$((n + 1)); fails=$((fails + 1)); echo "FALLO $*"; }
+bad() { n=$((n + 1)); fails=$((fails + 1)); echo "FAIL  $*"; }
 check() { local d="$1"; shift; if "$@"; then ok "$d"; else bad "$d"; fi; }
 
 # Copia de vsctl: rutas temporales, sin comprobación de root, sin despacho final.
@@ -213,5 +213,22 @@ check "Chrome no está en el grupo" bash -c "! { $(declare -f group_main_running
 APP_ID=(); APP_PATH=(); APP_EXE=(); APP_ARGS=(); APP_NAME=()
 check "sin apps configuradas no se toca nada" test -z "$(stray_pids any)"
 
-echo; echo "$((n - fails))/$n pruebas superadas"
+# ── idioma de los mensajes ──────────────────────────────────────────────────
+# simula `sudo -u USER defaults read <dominio> AppleLanguages`
+sudo() { if [[ "$*" == *local.vpnselectivo.menu* ]]; then [ -n "${APP_LANG:-}" ] || return 1; printf '(\n    "%s"\n)\n' "$APP_LANG"
+         else printf '(\n    "%s",\n    "en-US"\n)\n' "$FAKE_LANG"; fi; }
+APP_LANG=""
+FAKE_LANG=es-CL; detect_lang
+check "idioma: es-CL → español" test "$VS_LANG" = es
+check "idioma: t() devuelve el texto en español" test "$(t "Connected" "Conectado")" = Conectado
+FAKE_LANG=en-GB; detect_lang
+check "idioma: en-GB → inglés" test "$VS_LANG" = en
+FAKE_LANG=fr-FR; detect_lang
+check "idioma: otro idioma → inglés" test "$(t "Connected" "Conectado")" = Connected
+FAKE_LANG=en-CL; APP_LANG=es; detect_lang
+check "idioma: el idioma elegido solo para la app tiene prioridad" test "$VS_LANG" = es
+APP_LANG=""
+unset -f sudo
+
+echo; echo "$((n - fails))/$n tests passed"
 [ "$fails" = 0 ]

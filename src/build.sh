@@ -22,16 +22,16 @@ WGGO_SHA256=c7eeffb13e5eb43b93e54a21d78dd71414771af9e07112da5275690493695c9c
 WGT_VERSION=1.0.20260223
 WGT_SHA256=af459827b80bfd31b83b08077f4b5843acb7d18ad9a33a2ef532d3090f291fbf
 
-[ "$(uname -m)" = arm64 ] || { echo "Este kit está preparado para Apple Silicon (arm64)."; exit 1; }
-xcode-select -p >/dev/null 2>&1 || { echo "Faltan las Command Line Tools: ejecuta  xcode-select --install"; exit 1; }
+[ "$(uname -m)" = arm64 ] || { echo "This kit is built for Apple Silicon (arm64)."; exit 1; }
+xcode-select -p >/dev/null 2>&1 || { echo "Command Line Tools are missing: run  xcode-select --install"; exit 1; }
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/vpnselectivo-build.XXXXXX")
 trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 fetch() {   # url archivo sha256
-    echo "· descargando $(basename "$2")"
+    echo "· downloading $(basename "$2")"
     curl -fsSL --retry 2 -o "$WORK/$2" "$1"
-    echo "$3  $WORK/$2" | shasum -a 256 -c --quiet || { echo "SHA-256 incorrecto para $2"; exit 1; }
+    echo "$3  $WORK/$2" | shasum -a 256 -c --quiet || { echo "Wrong SHA-256 for $2"; exit 1; }
 }
 fetch "https://go.dev/dl/go$GO_VERSION.darwin-arm64.tar.gz" go.tgz "$GO_SHA256"
 fetch "https://git.zx2c4.com/wireguard-go/snapshot/wireguard-go-$WGGO_VERSION.tar.xz" wgg.tar.xz "$WGGO_SHA256"
@@ -42,13 +42,13 @@ tar -xzf "$WORK/go.tgz" -C "$WORK"
 tar -xf "$WORK/wgg.tar.xz" -C "$WORK"
 tar -xf "$WORK/wgt.tar.xz" -C "$WORK"
 
-echo "· wireguard-go + parche NAT"
+echo "· wireguard-go + NAT patch"
 WGG="$WORK/wireguard-go-$WGGO_VERSION"
 patch -d "$WGG" -p1 --forward -s < "$KIT/third_party/wireguard-go-nat.patch"
 export GOCACHE="$WORK/gocache" GOMODCACHE="$WORK/gomod" GOTOOLCHAIN=local GOFLAGS=-mod=mod GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org
 (cd "$WGG" && CGO_ENABLED=1 MACOSX_DEPLOYMENT_TARGET=13.0 "$WORK/go/bin/go" build -trimpath -buildvcs=false \
     -ldflags='-s -w -buildid=' -o "$OUT/bin/wireguard-go" .)
-(cd "$WGG" && "$WORK/go/bin/go" test . >/dev/null) || { echo "tests del parche NAT fallidos"; exit 1; }
+(cd "$WGG" && "$WORK/go/bin/go" test . >/dev/null) || { echo "NAT patch tests failed"; exit 1; }
 "$OUT/bin/wireguard-go" --version | grep -q "v$WGGO_VERSION"
 
 echo "· wg"
@@ -84,6 +84,10 @@ bundle() {   # nombre id ejecutable-origen nombre-ejecutable icono-origen color 
 bundle "VPN Selectivo" local.vpnselectivo.menu "$WORK/VPNSelectivo" VPNSelectivo - 1F8A4C
 # App normal: ícono en el Dock y ventana de control (además del escudo).
 /usr/libexec/PlistBuddy -c "Set :LSUIElement false" "$OUT/apps/VPN Selectivo.app/Contents/Info.plist"
+# Inglés y español (según el idioma del Mac), también en los diálogos del sistema.
+/usr/libexec/PlistBuddy -c "Add :CFBundleDevelopmentRegion string en" -c "Add :CFBundleLocalizations array" \
+    -c "Add :CFBundleLocalizations:0 string en" -c "Add :CFBundleLocalizations:1 string es" \
+    -c "Add :CFBundleAllowMixedLocalizations bool true" "$OUT/apps/VPN Selectivo.app/Contents/Info.plist"
 codesign --force --sign - "$OUT/apps/VPN Selectivo.app" >/dev/null 2>&1
 # Los lanzadores del Dock ("<App> VPN.app") los genera vsctl al agregar cada
 # app protegida, con estas dos herramientas.
@@ -94,4 +98,4 @@ for b in launcher makeicon; do codesign --force --sign - "$OUT/libexec/$b" >/dev
 for b in wireguard-go wg vpnrun; do codesign --force --sign - "$OUT/bin/$b" >/dev/null 2>&1; done
 
 (cd "$OUT" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS)
-echo "Compilación terminada en $OUT"
+echo "Build finished in $OUT"

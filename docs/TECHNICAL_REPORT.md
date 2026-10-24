@@ -190,17 +190,18 @@ Removed in System Settings › General › Device Management.
 
 * WireGuard sources: SHA-256 match the values pinned by VPNonly.
 * NAT patch `go test`: OK. `wg`, `vpnrun`, the app and the launchers build.
-* `tests/unit.sh`: **70/70** — Mullvad config parser (CRLF, IPv6 endpoint
+* `tests/unit.sh`: **75/75** — Mullvad config parser (CRLF, IPv6 endpoint
   rejected, invalid keys, `PostUp` discarded), PF rules (route-to before block,
   SOCKS guard, LAN with router blocked, CGNAT excluded, tampered interface name
   rejected), relay-list validation and weighted selection, `apps.conf` parsing
   (tampered lines rejected), outside-launch detection (Brave, crashpad, helpers,
   `node`; updater, notifications, other apps and other users untouched), grace
-  periods (including children of a graced process), Auto-VPN global/per app.
+  periods (including children of a graced process), Auto-VPN global/per app,
+  message language (Mac language, per-app language override).
   The tests found and fixed 2 real parser bugs before installation.
 * `shellcheck` 0.11: no warnings. `visudo -c` on the rule: OK. Plists: OK.
 
-### Live (installed) — `tests/live-tests.sh` or control window › *Autodiagnóstico*
+### Live (installed) — `tests/live-tests.sh` or control window › *Self-Test*
 
 1. PF enabled, `com.apple/*` hook and anchor intact.
 2. Protected process → `am.i.mullvad.net` reports `mullvad_exit_ip: true`.

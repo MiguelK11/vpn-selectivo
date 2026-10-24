@@ -5,6 +5,10 @@
 // el grupo protegido.
 import AppKit
 
+// English, or Spanish when it is the Mac's first preferred language.
+let spanish = (Locale.preferredLanguages.first ?? "en").lowercased().hasPrefix("es")
+func L(_ en: String, _ es: String) -> String { spanish ? es : en }
+
 let target = Bundle.main.object(forInfoDictionaryKey: "VSLaunchApp") as? String ?? ""
 let p = Process()
 p.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
@@ -21,12 +25,12 @@ do {
 } catch {
     message = error.localizedDescription
 }
-if p.terminationStatus != 0 || message.contains("AVISO") {
+if p.terminationStatus != 0 || message.contains("AVISO") || message.contains("NOTE:") {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     let a = NSAlert()
-    a.messageText = p.terminationStatus != 0 ? "VPN Selectivo no pudo abrir la app" : "VPN Selectivo"
-    a.informativeText = message.isEmpty ? "Error desconocido (¿está instalado VPN Selectivo?)" : message
+    a.messageText = p.terminationStatus != 0 ? L("VPN Selectivo could not open the app", "VPN Selectivo no pudo abrir la app") : "VPN Selectivo"
+    a.informativeText = message.isEmpty ? L("Unknown error (is VPN Selectivo installed?)", "Error desconocido (¿está instalado VPN Selectivo?)") : message
     a.alertStyle = p.terminationStatus != 0 ? .critical : .warning
     app.activate(ignoringOtherApps: true)
     a.runModal()

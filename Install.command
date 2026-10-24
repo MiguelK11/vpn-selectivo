@@ -205,7 +205,7 @@ cat <<EOF
 • You can also use the "<App> VPN" launchers in /Applications/VPN Selectivo or the
   shield in the menu bar. Remove the original icons of protected apps from the
   Dock (if you open them that way, they are closed and reopened protected).
-• Test it: control window › "Autodiagnóstico" (self-test button).
+• Test it: control window › "Self-Test".
 • Disconnect the official Mullvad app so the rest of your Mac stays off the VPN.
 • Log: /Library/Logs/VPNSelectivo.log   Uninstall: Uninstall.command
 EOF

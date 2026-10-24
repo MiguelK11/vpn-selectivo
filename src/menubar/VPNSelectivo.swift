@@ -66,7 +66,7 @@ func runVsctlAsAdmin(_ args: [String], prompt: String) -> (ok: Bool, out: String
     let script = "do shell script \(cmd) with administrator privileges with prompt \"\(prompt)\""
     var err: NSDictionary?
     if let r = NSAppleScript(source: script)?.executeAndReturnError(&err) { return (true, r.stringValue ?? "") }
-    return (false, (err?[NSAppleScript.errorMessage] as? String) ?? "Cancelado")
+    return (false, (err?[NSAppleScript.errorMessage] as? String) ?? L("Cancelled", "Cancelado"))
 }
 
 struct Status: Codable {
@@ -93,6 +93,12 @@ struct Status: Codable {
     var exit_country: String?
     var exit_city: String?
 }
+
+// ── idioma de la interfaz ─────────────────────────────────────────────────
+// Español si es el primer idioma preferido del Mac; inglés en cualquier otro
+// caso. vsctl detecta el mismo ajuste (AppleLanguages) para sus mensajes.
+let UI_SPANISH = (Locale.preferredLanguages.first ?? "en").lowercased().hasPrefix("es")
+func L(_ en: String, _ es: String) -> String { UI_SPANISH ? es : en }
 
 // ── información de procesos (sin privilegios) ──────────────────────────────
 func procRealGID(_ pid: pid_t) -> gid_t? {
@@ -137,7 +143,7 @@ func runVsctl(_ args: [String]) -> (ok: Bool, out: String) {
     let pipe = Pipe()
     p.standardOutput = pipe
     p.standardError = pipe
-    do { try p.run() } catch { return (false, "No se pudo ejecutar vsctl: \(error.localizedDescription)") }
+    do { try p.run() } catch { return (false, L("Could not run vsctl: ", "No se pudo ejecutar vsctl: ") + error.localizedDescription) }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
     return (p.terminationStatus == 0, String(decoding: data, as: UTF8.self))
@@ -232,19 +238,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func look() -> (Look, String) {
         guard let s = status, statusFresh else {
-            return (.missing, "El servicio de VPN Selectivo no responde")
+            return (.missing, L("The VPN Selectivo service is not responding", "El servicio de VPN Selectivo no responde"))
         }
-        if s.pf == "broken" { return (.alert, "Cortafuegos alterado: apps protegidas congeladas") }
-        if !s.configured { return (.alert, "Falta importar la configuración de Mullvad") }
+        if s.pf == "broken" { return (.alert, L("Firewall altered: protected apps frozen", "Cortafuegos alterado: apps protegidas congeladas")) }
+        if !s.configured { return (.alert, L("Mullvad configuration not imported yet", "Falta importar la configuración de Mullvad")) }
         let apps = s.protected
         switch s.tunnel {
-        case "up": return (.protected, "Protegido · \(describe(s.server))")
-        case "stale": return (.connecting, "Sin respuesta del servidor \(s.server): tráfico protegido detenido")
+        case "up": return (.protected, L("Protected · ", "Protegido · ") + describe(s.server))
+        case "stale": return (.connecting, L("Server \(s.server) not responding: protected traffic stopped", "Sin respuesta del servidor \(s.server): tráfico protegido detenido"))
         default:
             if s.manual_down { return (apps > 0 ? .blocked : .idle,
-                                       apps > 0 ? "Desconectado: apps protegidas SIN Internet (bloqueadas)" : "Desconectado") }
-            if apps > 0 { return (.blocked, "Conectando… (apps protegidas bloqueadas hasta conectar)") }
-            return (.idle, "Inactivo · se conecta al abrir una app protegida")
+                                       apps > 0 ? L("Disconnected: protected apps have NO Internet (blocked)", "Desconectado: apps protegidas SIN Internet (bloqueadas)") : L("Disconnected", "Desconectado")) }
+            if apps > 0 { return (.blocked, L("Connecting… (protected apps blocked until connected)", "Conectando… (apps protegidas bloqueadas hasta conectar)")) }
+            return (.idle, L("Idle · connects when you open an app with ⚡", "Inactivo · se conecta al abrir una app con ⚡"))
         }
     }
 
@@ -279,71 +285,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let head = NSMenuItem(title: text, action: nil, keyEquivalent: "")
         head.isEnabled = false
         menu.addItem(head)
-        menu.addItem(item("Abrir panel de control…", #selector(showControl)))
+        menu.addItem(item(L("Open Control Panel…", "Abrir panel de control…"), #selector(showControl)))
         if let s = status, statusFresh {
             let open = s.running.split(separator: ",").compactMap { id in apps.first { $0.id == id }?.name }
-            var detail = open.isEmpty ? "Ninguna app protegida abierta" : "Abiertas: " + open.joined(separator: ", ")
+            var detail = open.isEmpty ? L("No protected app is open", "Ninguna app protegida abierta") : L("Open: ", "Abiertas: ") + open.joined(separator: ", ")
             if s.tunnel == "up" || s.tunnel == "stale" {
-                detail += " · handshake hace \(s.handshake_age) s · ↓\(humanBytes(s.rx)) ↑\(humanBytes(s.tx))"
+                detail += L(" · handshake \(s.handshake_age) s ago", " · handshake hace \(s.handshake_age) s") + " · ↓\(humanBytes(s.rx)) ↑\(humanBytes(s.tx))"
             }
             let d = NSMenuItem(title: detail, action: nil, keyEquivalent: ""); d.isEnabled = false
             menu.addItem(d)
             if s.official_mullvad == "Connected" || s.official_mullvad == "Connecting" {
-                let w = NSMenuItem(title: "⚠︎ El cliente oficial de Mullvad está conectado (todo el Mac va por VPN)", action: nil, keyEquivalent: "")
+                let w = NSMenuItem(title: L("⚠︎ The official Mullvad app is connected (your whole Mac uses the VPN)", "⚠︎ El cliente oficial de Mullvad está conectado (todo el Mac va por VPN)"), action: nil, keyEquivalent: "")
                 w.isEnabled = false
                 menu.addItem(w)
             }
             if !s.error.isEmpty && s.tunnel != "up" {
-                let e = NSMenuItem(title: "Último error: \(errorText(s.error))", action: nil, keyEquivalent: ""); e.isEnabled = false
+                let e = NSMenuItem(title: L("Last error: ", "Último error: ") + errorText(s.error), action: nil, keyEquivalent: ""); e.isEnabled = false
                 menu.addItem(e)
             }
         }
         menu.addItem(.separator())
         apps = loadApps()
         if apps.isEmpty {
-            let e = NSMenuItem(title: "No hay apps protegidas: agrega una abajo", action: nil, keyEquivalent: ""); e.isEnabled = false
+            let e = NSMenuItem(title: L("No protected apps: add one below", "No hay apps protegidas: agrega una abajo"), action: nil, keyEquivalent: ""); e.isEnabled = false
             menu.addItem(e)
         }
         for a in apps {
-            let it = item("Abrir \(a.name) (VPN)", #selector(openApp(_:)))
+            let it = item(L("Open \(a.name) (VPN)", "Abrir \(a.name) (VPN)"), #selector(openApp(_:)))
             it.representedObject = a.id
             if let icon = Bundle(path: a.path).map({ NSWorkspace.shared.icon(forFile: $0.bundlePath) }) {
                 icon.size = NSSize(width: 16, height: 16); it.image = icon
             }
             menu.addItem(it)
         }
-        let manage = NSMenuItem(title: "Apps protegidas", action: nil, keyEquivalent: "")
+        let manage = NSMenuItem(title: L("Protected Apps", "Apps protegidas"), action: nil, keyEquivalent: "")
         let mm = NSMenu()
-        mm.addItem(item("Agregar app protegida…", #selector(addApp)))
-        let rem = NSMenuItem(title: "Quitar app protegida", action: nil, keyEquivalent: "")
+        mm.addItem(item(L("Add Protected App…", "Agregar app protegida…"), #selector(addApp)))
+        let rem = NSMenuItem(title: L("Remove Protected App", "Quitar app protegida"), action: nil, keyEquivalent: "")
         let rm = NSMenu()
         for a in apps {
             let it = item("\(a.name)\(a.args.isEmpty ? "" : " (" + a.args.joined(separator: " ") + ")")", #selector(removeApp(_:)))
             it.representedObject = a.id
             rm.addItem(it)
         }
-        if apps.isEmpty { let e = NSMenuItem(title: "(ninguna)", action: nil, keyEquivalent: ""); e.isEnabled = false; rm.addItem(e) }
+        if apps.isEmpty { let e = NSMenuItem(title: L("(none)", "(ninguna)"), action: nil, keyEquivalent: ""); e.isEnabled = false; rm.addItem(e) }
         rem.submenu = rm
         mm.addItem(rem)
         manage.submenu = mm
         menu.addItem(manage)
         menu.addItem(.separator())
-        menu.addItem(item("Comprobar IP de salida…", #selector(checkIP)))
+        menu.addItem(item(L("Check Exit IP…", "Comprobar IP de salida…"), #selector(checkIP)))
         if let s = status, s.tunnel == "up" {
-            menu.addItem(item("Desconectar VPN (las apps protegidas quedan sin Internet)", #selector(disconnect)))
+            menu.addItem(item(L("Disconnect VPN (protected apps lose Internet)", "Desconectar VPN (las apps protegidas quedan sin Internet)"), #selector(disconnect)))
         } else {
-            menu.addItem(item("Conectar VPN", #selector(connect)))
+            menu.addItem(item(L("Connect VPN", "Conectar VPN"), #selector(connect)))
         }
         relays = loadRelays()
         menu.addItem(locationItem())
-        menu.addItem(item("Importar configuración WireGuard de Mullvad…", #selector(importConfig)))
+        menu.addItem(item(L("Import Mullvad WireGuard Configuration…", "Importar configuración WireGuard de Mullvad…"), #selector(importConfig)))
         menu.addItem(.separator())
-        menu.addItem(item("Autodiagnóstico de fugas…", #selector(selftest)))
-        menu.addItem(item("Vigilar fugas 60 s (con apps abiertas)…", #selector(leakwatch)))
-        menu.addItem(item("Abrir registro", #selector(openLog)))
-        menu.addItem(item("Ayuda", #selector(openHelp)))
+        menu.addItem(item(L("Leak Self-Test…", "Autodiagnóstico de fugas…"), #selector(selftest)))
+        menu.addItem(item(L("Watch for Leaks for 60 s (with apps open)…", "Vigilar fugas 60 s (con apps abiertas)…"), #selector(leakwatch)))
+        menu.addItem(item(L("Open Log", "Abrir registro"), #selector(openLog)))
+        menu.addItem(item(L("Help", "Ayuda"), #selector(openHelp)))
         menu.addItem(.separator())
-        menu.addItem(item("Salir de la app de menú (la protección sigue activa)", #selector(quit)))
+        menu.addItem(item(L("Quit the App (protection stays active)", "Salir de la app (la protección sigue activa)"), #selector(quit)))
     }
 
     func item(_ title: String, _ sel: Selector) -> NSMenuItem {
@@ -354,13 +360,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func errorText(_ code: String) -> String {
         switch code {
-        case "no_config": return "no hay configuración de Mullvad importada"
-        case "bad_config": return "configuración de servidor inválida"
-        case "handshake_failed": return "el servidor no respondió (¿sin Internet o clave revocada?)"
-        case "wg_start_failed", "wg_config_failed": return "no se pudo iniciar WireGuard"
-        case "missing_binaries": return "faltan componentes; reinstala"
-        case "pf_failed": return "no se pudieron cargar las reglas del cortafuegos"
-        case "no_server": return "no hay servidores activos en la ubicación elegida"
+        case "no_config": return L("no Mullvad configuration imported", "no hay configuración de Mullvad importada")
+        case "bad_config": return L("invalid server configuration", "configuración de servidor inválida")
+        case "handshake_failed": return L("the server did not answer (no Internet, or revoked key?)", "el servidor no respondió (¿sin Internet o clave revocada?)")
+        case "wg_start_failed", "wg_config_failed": return L("could not start WireGuard", "no se pudo iniciar WireGuard")
+        case "missing_binaries": return L("components missing; reinstall", "faltan componentes; reinstala")
+        case "pf_failed": return L("could not load the firewall rules", "no se pudieron cargar las reglas del cortafuegos")
+        case "no_server": return L("no active servers in the chosen location", "no hay servidores activos en la ubicación elegida")
         default: return code
         }
     }
@@ -373,7 +379,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if restore { args.append("--restore") }
             let r = runVsctl(args)
             if !r.ok {
-                DispatchQueue.main.async { self.alert("No se pudo abrir \(app)", r.out) }
+                DispatchQueue.main.async { self.alert(L("Could not open \(app)", "No se pudo abrir \(app)"), r.out) }
             }
         }
     }
@@ -381,10 +387,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let id = sender.representedObject as? String { launch(id) }
     }
 
-    // ── agregar / quitar apps protegidas (piden contraseña de administrador) ──
+    // ── agregar / quitar apps protegidas (sin contraseña: regla sudoers) ──
     @objc func addApp() {
         let panel = NSOpenPanel()
-        panel.title = "Elige la app que debe usar siempre la VPN"
+        panel.title = L("Choose the app that must always use the VPN", "Elige la app que debe usar siempre la VPN")
         panel.directoryURL = URL(fileURLWithPath: "/Applications")
         panel.allowedContentTypes = [.application]
         panel.canChooseDirectories = false
@@ -392,7 +398,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let path = url.path
         guard path.hasPrefix("/Applications/") || path.hasPrefix(NSHomeDirectory() + "/Applications/") else {
-            alert("Ubicación no admitida", "La app debe estar en /Applications o en ~/Applications."); return
+            alert(L("Unsupported location", "Ubicación no admitida"), L("The app must be in /Applications or ~/Applications.", "La app debe estar en /Applications o en ~/Applications.")); return
         }
         let bundle = Bundle(path: path)
         var name = (bundle?.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
@@ -401,35 +407,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         name = String(name.filter { !"\"'\\$`/|<>;&".contains($0) }.prefix(40))
         let id = appSlug(name, taken: apps.map { $0.id })
         let a = NSAlert()
-        a.messageText = "¿Proteger \(name)?"
-        a.informativeText = "\(name) usará siempre Mullvad: si la VPN cae, se queda sin Internet. Si la abres por fuera (Dock, Spotlight), se cerrará y se reabrirá protegida.\n\nFunciona con apps que hacen su propia conexión (navegadores Chromium/Firefox, apps Electron, clientes torrent). Las apps de Apple que usan servicios del sistema (Safari, Mail…) no quedan cubiertas."
-        a.addButton(withTitle: "Proteger"); a.addButton(withTitle: "Cancelar")
+        a.messageText = L("Protect \(name)?", "¿Proteger \(name)?")
+        a.informativeText = L("\(name) will always use Mullvad: if the VPN drops, it loses Internet access. If you open it the usual way (Dock, Spotlight), it is closed and reopened protected.\n\nWorks with apps that make their own connections (Chromium/Firefox browsers, Electron apps, torrent clients). Apple apps that rely on system services (Safari, Mail…) are not covered.", "\(name) usará siempre Mullvad: si la VPN cae, se queda sin Internet. Si la abres por fuera (Dock, Spotlight), se cerrará y se reabrirá protegida.\n\nFunciona con apps que hacen su propia conexión (navegadores Chromium/Firefox, apps Electron, clientes torrent). Las apps de Apple que usan servicios del sistema (Safari, Mail…) no quedan cubiertas.")
+        a.addButton(withTitle: L("Protect", "Proteger")); a.addButton(withTitle: L("Cancel", "Cancelar"))
         guard a.runModal() == .alertFirstButtonReturn else { return }
-        let r = runVsctlAsAdmin(["app-add", id, name, path], prompt: "VPN Selectivo: proteger \(name)")
+        let r = runVsctl(["app-add", id, name, path])
         apps = loadApps()
-        alert(r.ok ? "App protegida" : "No se pudo agregar", r.out)
+        alert(r.ok ? L("App protected", "App protegida") : L("Could not add the app", "No se pudo agregar"), r.out)
     }
 
     @objc func removeApp(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String, let e = apps.first(where: { $0.id == id }) else { return }
         let a = NSAlert()
-        a.messageText = "¿Dejar de proteger \(e.name)?"
-        a.informativeText = "Volverá a usar tu conexión normal la próxima vez que la abras. Si está abierta ahora, sigue protegida hasta que la cierres."
-        a.addButton(withTitle: "Quitar"); a.addButton(withTitle: "Cancelar")
+        a.messageText = L("Stop protecting \(e.name)?", "¿Dejar de proteger \(e.name)?")
+        a.informativeText = L("It will use your normal connection next time you open it. If it is open now, it stays in the tunnel until you quit it.", "Volverá a usar tu conexión normal la próxima vez que la abras. Si está abierta ahora, sigue en el túnel hasta que la cierres.")
+        a.addButton(withTitle: L("Remove", "Quitar")); a.addButton(withTitle: L("Cancel", "Cancelar"))
         NSApp.activate(ignoringOtherApps: true)
         guard a.runModal() == .alertFirstButtonReturn else { return }
-        let r = runVsctlAsAdmin(["app-remove", id], prompt: "VPN Selectivo: dejar de proteger \(e.name)")
+        let r = runVsctl(["app-remove", id])
         apps = loadApps()
-        if !r.ok { alert("No se pudo quitar", r.out) } else { notify(r.out) }
+        if !r.ok { alert(L("Could not remove the app", "No se pudo quitar"), r.out) } else { notify(r.out) }
     }
 
-    @objc func connect() { work.async { let r = runVsctl(["connect"]); if !r.ok { DispatchQueue.main.async { self.alert("No se pudo conectar", r.out) } } } }
+    @objc func connect() { work.async { let r = runVsctl(["connect"]); if !r.ok { DispatchQueue.main.async { self.alert(L("Could not connect", "No se pudo conectar"), r.out) } } } }
 
     @objc func disconnect() {
         let a = NSAlert()
-        a.messageText = "¿Desconectar la VPN?"
-        a.informativeText = "Las apps protegidas NO se cerrarán: quedarán abiertas pero sin Internet (bloqueadas) hasta que vuelvas a conectar o abras una app protegida. Chrome y el resto del Mac no se ven afectados."
-        a.addButton(withTitle: "Desconectar"); a.addButton(withTitle: "Cancelar")
+        a.messageText = L("Disconnect the VPN?", "¿Desconectar la VPN?")
+        a.informativeText = L("Protected apps will NOT be closed: they stay open but without Internet access (blocked) until you reconnect or open an app with ⚡. The rest of your Mac is not affected.", "Las apps protegidas NO se cerrarán: quedarán abiertas pero sin Internet (bloqueadas) hasta que vuelvas a conectar o abras una app con ⚡. El resto del Mac no se ve afectado.")
+        a.addButton(withTitle: L("Disconnect", "Desconectar")); a.addButton(withTitle: L("Cancel", "Cancelar"))
         NSApp.activate(ignoringOtherApps: true)
         if a.runModal() == .alertFirstButtonReturn { work.async { runVsctl(["disconnect"]) } }
     }
@@ -439,8 +445,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // "us-nyc-wg-301" → servidor concreto.
     func describe(_ code: String) -> String {
         if let r = relays.first(where: { $0.host == code }) { return "\(flag(r.cc)) \(r.country), \(r.city) · \(r.host)" }
-        if let r = relays.first(where: { $0.loc == code }) { return "\(flag(r.cc)) \(r.country), \(r.city) (automático)" }
-        if let r = relays.first(where: { $0.cc == code }) { return "\(flag(r.cc)) \(r.country) (automático)" }
+        if let r = relays.first(where: { $0.loc == code }) { return "\(flag(r.cc)) \(r.country), \(r.city) " + L("(automatic)", "(automático)") }
+        if let r = relays.first(where: { $0.cc == code }) { return "\(flag(r.cc)) \(r.country) " + L("(automatic)", "(automático)") }
         return code
     }
 
@@ -454,7 +460,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func locationItem() -> NSMenuItem {
         let sel = status?.selected ?? ""
-        let top = NSMenuItem(title: "Ubicación: \(describe(sel))", action: nil, keyEquivalent: "")
+        let top = NSMenuItem(title: L("Location: ", "Ubicación: ") + describe(sel), action: nil, keyEquivalent: "")
         let sub = NSMenu()
         sub.autoenablesItems = false
         if relays.isEmpty {
@@ -464,7 +470,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 sub.addItem(choice(name, name, line.hasPrefix("*") ? name : sel))
             }
             sub.addItem(.separator())
-            sub.addItem(item("Descargar la lista de servidores de Mullvad", #selector(updateRelays)))
+            sub.addItem(item(L("Download Mullvad's Server List", "Descargar la lista de servidores de Mullvad"), #selector(updateRelays)))
             top.submenu = sub
             return top
         }
@@ -477,7 +483,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             cItem.isEnabled = active > 0
             let cMenu = NSMenu()
             cMenu.autoenablesItems = false
-            cMenu.addItem(choice("Cualquier ciudad (automático)", cc, sel))
+            cMenu.addItem(choice(L("Any city (automatic)", "Cualquier ciudad (automático)"), cc, sel))
             cMenu.addItem(.separator())
             let cities = Dictionary(grouping: rs, by: { $0.loc }).sorted { $0.value[0].city < $1.value[0].city }
             for (loc, crs) in cities {
@@ -486,10 +492,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 cityItem.isEnabled = crs.contains { $0.active }
                 let m = NSMenu()
                 m.autoenablesItems = false
-                m.addItem(choice("Automático (\(crs.filter { $0.active }.count) servidores)", loc, sel))
+                m.addItem(choice(L("Automatic (\(crs.filter { $0.active }.count) servers)", "Automático (\(crs.filter { $0.active }.count) servidores)"), loc, sel))
                 m.addItem(.separator())
                 for r in crs.sorted(by: { $0.host < $1.host }) {
-                    let it = choice(r.active ? r.host : "\(r.host) (fuera de servicio)", r.host, sel)
+                    let it = choice(r.active ? r.host : r.host + L(" (out of service)", " (fuera de servicio)"), r.host, sel)
                     it.isEnabled = r.active
                     m.addItem(it)
                 }
@@ -500,7 +506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sub.addItem(cItem)
         }
         sub.addItem(.separator())
-        sub.addItem(item("Actualizar lista de servidores", #selector(updateRelays)))
+        sub.addItem(item(L("Update Server List", "Actualizar lista de servidores"), #selector(updateRelays)))
         top.submenu = sub
         return top
     }
@@ -508,12 +514,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func selectLocation(_ sender: NSMenuItem) {
         guard let code = sender.representedObject as? String else { return }
         let name = describe(code)
-        notify("Cambiando a \(name)… Las apps protegidas quedan sin Internet unos segundos mientras reconecta.")
+        notify(L("Switching to \(name)… Protected apps are offline for a few seconds while it reconnects.", "Cambiando a \(name)… Las apps protegidas quedan sin Internet unos segundos mientras reconecta."))
         work.async {
             let r = runVsctl(["select", code])
             DispatchQueue.main.async {
                 if r.ok { self.notify(r.out.trimmingCharacters(in: .whitespacesAndNewlines)) }
-                else { self.alert("No se pudo cambiar de ubicación", r.out) }
+                else { self.alert(L("Could not change location", "No se pudo cambiar de ubicación"), r.out) }
             }
         }
     }
@@ -524,7 +530,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 self.relays = loadRelays()
                 if r.ok { self.notify(r.out.trimmingCharacters(in: .whitespacesAndNewlines)) }
-                else { self.alert("No se pudo actualizar la lista", r.out) }
+                else { self.alert(L("Could not update the list", "No se pudo actualizar la lista"), r.out) }
             }
         }
     }
@@ -532,34 +538,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func importConfig() {
         let panel = NSOpenPanel()
-        panel.title = "Configuración WireGuard de Mullvad (.conf o .zip)"
+        panel.title = L("Mullvad WireGuard configuration (.conf or .zip)", "Configuración WireGuard de Mullvad (.conf o .zip)")
         panel.allowedContentTypes = [UTType(filenameExtension: "conf") ?? .data, .zip]
         panel.allowsMultipleSelection = false
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
         // Importar exige contraseña de administrador (no está en la regla sudoers).
-        let r = runVsctlAsAdmin(["import", url.path], prompt: "VPN Selectivo: importar configuración de Mullvad")
-        alert(r.ok ? "Configuración importada" : "No se pudo importar", r.out)
+        let r = runVsctlAsAdmin(["import", url.path], prompt: L("VPN Selectivo: import Mullvad configuration", "VPN Selectivo: importar configuración de Mullvad"))
+        alert(r.ok ? L("Configuration imported", "Configuración importada") : L("Could not import", "No se pudo importar"), r.out)
     }
 
     @objc func checkIP() {
         work.async {
             let r = runVsctl(["check-ip"])
-            DispatchQueue.main.async { self.alert("IP de salida", r.out, mono: true) }
+            DispatchQueue.main.async { self.alert(L("Exit IP", "IP de salida"), r.out, mono: true) }
         }
     }
     @objc func selftest() {
-        notify("Ejecutando autodiagnóstico (unos 30 s; incluye cortar el túnel a propósito)…")
+        notify(L("Running the self-test (about 30 s; it deliberately drops the tunnel)…", "Ejecutando autodiagnóstico (unos 30 s; incluye cortar el túnel a propósito)…"))
         work.async {
             let r = runVsctl(["selftest"])
-            DispatchQueue.main.async { self.alert(r.ok ? "Autodiagnóstico superado" : "Autodiagnóstico con fallos", r.out, mono: true) }
+            DispatchQueue.main.async { self.alert(r.ok ? L("Self-test passed", "Autodiagnóstico superado") : L("Self-test found problems", "Autodiagnóstico con fallos"), r.out, mono: true) }
         }
     }
     @objc func leakwatch() {
-        notify("Vigilando fugas durante 60 s: usa tus apps protegidas con normalidad…")
+        notify(L("Watching for leaks for 60 s: use your protected apps as usual…", "Vigilando fugas durante 60 s: usa tus apps protegidas con normalidad…"))
         work.async {
             let r = runVsctl(["leakwatch", "60"])
-            DispatchQueue.main.async { self.alert("Vigilancia de fugas", r.out, mono: true) }
+            DispatchQueue.main.async { self.alert(L("Leak watch", "Vigilancia de fugas"), r.out, mono: true) }
         }
     }
     @objc func openLog() { NSWorkspace.shared.open(URL(fileURLWithPath: LOG_PATH)) }
@@ -590,7 +596,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let target = entries.first { !$0.args.isEmpty && $0.args.allSatisfy(pargs.contains) }
                 ?? entries.first { $0.args.isEmpty } ?? entries[0]
             kill(pid, SIGKILL)
-            relaunchProtected(target.id, waitingFor: pid, message: "\(target.name) se abrió sin VPN: se cerró al instante y se reabre protegida.")
+            relaunchProtected(target.id, waitingFor: pid, message: L("\(target.name) was opened without the VPN: it was closed instantly and is reopening protected.", "\(target.name) se abrió sin VPN: se cerró al instante y se reabre protegida."))
         }
         knownPIDs = current
     }
@@ -611,7 +617,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 self.lastLaunch[target] = Date()
                 self.relaunching.remove(key)
-                if !r.ok { self.alert("No se pudo reabrir protegida", r.out) }
+                if !r.ok { self.alert(L("Could not reopen it protected", "No se pudo reabrir protegida"), r.out) }
             }
         }
     }
@@ -638,12 +644,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     $0.bundleIdentifier == bid && procRealGID($0.processIdentifier) == gid
                 }
                 if !protectedRunning {
-                    relaunchProtected(target, waitingFor: nil, message: "\(e.name) se abrió sin VPN: se cerró y se reabre protegida.")
+                    relaunchProtected(target, waitingFor: nil, message: L("\(e.name) was opened without the VPN: it was closed and is reopening protected.", "\(e.name) se abrió sin VPN: se cerró y se reabre protegida."))
                 }
             case ("tunnel_lost", _):
-                notify("El túnel se cayó: las apps protegidas quedan sin Internet mientras se reconecta (no hay salida sin VPN).")
+                notify(L("The tunnel dropped: protected apps are offline while it reconnects (nothing goes out without the VPN).", "El túnel se cayó: las apps protegidas quedan sin Internet mientras se reconecta (no hay salida sin VPN)."))
             case ("pf_repaired", _):
-                notify("El cortafuegos fue alterado por otro programa y se restauró. Las apps protegidas se congelaron durante la reparación.")
+                notify(L("Another program altered the firewall; it was restored. Protected apps were frozen during the repair.", "El cortafuegos fue alterado por otro programa y se restauró. Las apps protegidas se congelaron durante la reparación."))
             default: break
             }
         }

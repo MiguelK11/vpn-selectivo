@@ -29,13 +29,13 @@ func scanInstalledApps() -> [InstalledApp] {
                 ?? String(item.dropLast(4))
             var why: String?
             if let bid = bid, bid.hasPrefix("com.apple.automator.") {
-                why = "Lanzador de Automator: solo abre otra app. Marca la app que abre (p. ej. Brave) y usa su acceso VPN."
+                why = L("Automator launcher: it only opens another app. Check the app it opens (e.g. Brave) and use its VPN launcher.", "Lanzador de Automator: solo abre otra app. Marca la app que abre (p. ej. Brave) y usa su acceso VPN.")
             } else if let bid = bid, bid.hasPrefix("com.apple.") {
-                why = "App de Apple: hace su conexión mediante servicios del sistema, que no pueden ir por el túnel."
+                why = L("Apple app: it connects through system services, which cannot go through the tunnel.", "App de Apple: hace su conexión mediante servicios del sistema, que no pueden ir por el túnel.")
             } else if let bid = bid, ["net.mullvad", "com.wireguard", "ch.protonvpn", "com.nordvpn", "com.expressvpn", "com.tunnelbear", "com.cisco.anyconnect", "com.paloaltonetworks", "com.fortinet", "local.vpnselectivo"].contains(where: bid.hasPrefix) {
-                why = "Es una VPN o parte de VPN Selectivo."
+                why = L("It is a VPN, or part of VPN Selectivo.", "Es una VPN o parte de VPN Selectivo.")
             } else if bid == nil {
-                why = "No es una app válida."
+                why = L("Not a valid app.", "No es una app válida.")
             }
             let icon = NSWorkspace.shared.icon(forFile: path)
             icon.size = NSSize(width: 32, height: 32)
@@ -65,11 +65,11 @@ enum RunState {
     case tunnel, blocked, pendingIn, pendingOut, direct
     var text: String {
         switch self {
-        case .tunnel: return "Abierta · por Mullvad"
-        case .blocked: return "Abierta · sin Internet (VPN apagada)"
-        case .pendingIn: return "Abierta sin VPN · reiníciala para protegerla"
-        case .pendingOut: return "Aún en el túnel · reiníciala para sacarla"
-        case .direct: return "Abierta · conexión normal"
+        case .tunnel: return L("Open · via Mullvad", "Abierta · por Mullvad")
+        case .blocked: return L("Open · no Internet (VPN off)", "Abierta · sin Internet (VPN apagada)")
+        case .pendingIn: return L("Open without VPN · restart it to protect it", "Abierta sin VPN · reiníciala para protegerla")
+        case .pendingOut: return L("Still in the tunnel · restart it to take it out", "Aún en el túnel · reiníciala para sacarla")
+        case .direct: return L("Open · normal connection", "Abierta · conexión normal")
         }
     }
     var color: Color {
@@ -103,20 +103,20 @@ final class ControlModel: ObservableObject {
     func isAuto(_ path: String) -> Bool { entries(path).contains { $0.auto } }
 
     var headline: (String, String, Color) {
-        guard let s = status, fresh else { return ("Servicio no disponible", "exclamationmark.triangle.fill", .orange) }
-        if s.pf == "broken" { return ("Cortafuegos alterado: apps protegidas congeladas", "exclamationmark.shield.fill", .red) }
-        if !s.configured { return ("Falta la configuración de Mullvad", "exclamationmark.shield.fill", .orange) }
+        guard let s = status, fresh else { return (L("Service unavailable", "Servicio no disponible"), "exclamationmark.triangle.fill", .orange) }
+        if s.pf == "broken" { return (L("Firewall altered: protected apps frozen", "Cortafuegos alterado: apps protegidas congeladas"), "exclamationmark.shield.fill", .red) }
+        if !s.configured { return (L("Mullvad configuration missing", "Falta la configuración de Mullvad"), "exclamationmark.shield.fill", .orange) }
         switch s.tunnel {
-        case "up": return ("Conectado", "lock.shield.fill", .green)
-        case "stale": return ("Servidor sin respuesta", "shield.lefthalf.filled", .orange)
+        case "up": return (L("Connected", "Conectado"), "lock.shield.fill", .green)
+        case "stale": return (L("Server not responding", "Servidor sin respuesta"), "shield.lefthalf.filled", .orange)
         default:
-            if (s.manual_on ?? false) { return ("Conectando…", "shield.lefthalf.filled", .orange) }
-            return ("Desconectado", "shield.slash", .secondary)
+            if (s.manual_on ?? false) { return (L("Connecting…", "Conectando…"), "shield.lefthalf.filled", .orange) }
+            return (L("Disconnected", "Desconectado"), "shield.slash", .secondary)
         }
     }
 
     var detail: String {
-        guard let s = status, fresh else { return "Comprueba que VPN Selectivo esté instalado." }
+        guard let s = status, fresh else { return L("Check that VPN Selectivo is installed.", "Comprueba que VPN Selectivo esté instalado.") }
         if tunnelUp {
             var parts: [String] = []
             if let r = relays.first(where: { $0.host == s.server }) {
@@ -126,16 +126,16 @@ final class ControlModel: ObservableObject {
             if let ip = s.exit_ip, !ip.isEmpty { parts.append("IP \(ip)") }
             return parts.joined(separator: " · ")
         }
-        return (s.manual_down) ? "Apagada a mano: las apps marcadas no tienen Internet."
-            : (autoVPN ? "Se encenderá al abrir una app con ⚡." : "Auto-VPN desactivado: enciéndela con el interruptor.")
+        return (s.manual_down) ? L("Switched off manually: checked apps have no Internet access.", "Apagada a mano: las apps marcadas no tienen Internet.")
+            : (autoVPN ? L("It will turn on when you open an app with ⚡.", "Se encenderá al abrir una app con ⚡.") : L("Auto-VPN is off: turn the VPN on with the switch.", "Auto-VPN desactivado: enciéndela con el interruptor."))
     }
 
     var routedSummary: String {
         let names = installed.filter { runStates[$0.path] == .tunnel }.map { $0.name }
-        if !names.isEmpty { return "Por el túnel ahora: " + names.joined(separator: ", ") }
+        if !names.isEmpty { return L("Through the tunnel now: ", "Por el túnel ahora: ") + names.joined(separator: ", ") }
         let blocked = installed.filter { runStates[$0.path] == .blocked }.map { $0.name }
-        if !blocked.isEmpty { return "Sin Internet (VPN apagada): " + blocked.joined(separator: ", ") }
-        return "Ninguna app marcada está abierta."
+        if !blocked.isEmpty { return L("No Internet (VPN off): ", "Sin Internet (VPN apagada): ") + blocked.joined(separator: ", ") }
+        return L("No checked app is open.", "Ninguna app marcada está abierta.")
     }
 
     // ── actualización (cada segundo, desde AppDelegate.refresh) ─────────────
@@ -176,54 +176,54 @@ final class ControlModel: ObservableObject {
     }
 
     func setVPN(_ on: Bool) {
-        run(on ? "Conectando…" : "Desconectando…") { runVsctl(on ? ["connect"] : ["disconnect"]) }
+        run(on ? L("Connecting…", "Conectando…") : L("Disconnecting…", "Desconectando…")) { runVsctl(on ? ["connect"] : ["disconnect"]) }
     }
 
     func setGlobalAuto(_ on: Bool) {
-        run("Guardando…") { runVsctl(["set-auto", on ? "on" : "off"]) }
+        run(L("Saving…", "Guardando…")) { runVsctl(["set-auto", on ? "on" : "off"]) }
     }
 
     func select(_ code: String) {
         guard !code.isEmpty, code != status?.selected else { return }
-        run("Cambiando a \(delegate?.describe(code) ?? code)…") { runVsctl(["select", code]) }
+        run(L("Switching to ", "Cambiando a ") + (delegate?.describe(code) ?? code) + "…") { runVsctl(["select", code]) }
     }
 
     func setAuto(_ app: InstalledApp, _ on: Bool) {
         guard let e = entries(app.path).first else { return }
-        run("Guardando…") { runVsctl(["app-auto", e.id, on ? "1" : "0"]) }
+        run(L("Saving…", "Guardando…")) { runVsctl(["app-auto", e.id, on ? "1" : "0"]) }
     }
 
     func setProtected(_ app: InstalledApp, _ on: Bool) {
-        if let why = app.unsupported, on { alert("No se puede proteger \(app.name)", why); return }
+        if let why = app.unsupported, on { alert(L("\(app.name) cannot be protected", "No se puede proteger \(app.name)"), why); return }
         let state = runStates[app.path]
         if on {
             let id = appSlug(app.name, taken: apps.map { $0.id })
             var restart = false
             if state == .direct {
-                restart = ask("\(app.name) está abierta sin VPN",
-                              "Para que su tráfico vaya por Mullvad hay que reiniciarla (se cierra de forma ordenada y se reabre protegida). Si eliges «Al cerrarla», seguirá usando tu conexión normal hasta que la cierres.",
-                              "Reiniciar ahora", "Al cerrarla")
+                restart = ask(L("\(app.name) is open without the VPN", "\(app.name) está abierta sin VPN"),
+                              L("For its traffic to go through Mullvad it must be restarted (it quits cleanly and reopens protected). If you choose “When I quit it”, it keeps your normal connection until you quit it.", "Para que su tráfico vaya por Mullvad hay que reiniciarla (se cierra de forma ordenada y se reabre protegida). Si eliges «Al cerrarla», seguirá usando tu conexión normal hasta que la cierres."),
+                              L("Restart Now", "Reiniciar ahora"), L("When I Quit It", "Al cerrarla"))
             }
-            run("Protegiendo \(app.name)…") {
+            run(L("Protecting \(app.name)…", "Protegiendo \(app.name)…")) {
                 var r = runVsctl(["app-add", id, cleanName(app.name), app.path])
                 if r.ok && restart {
                     if quitGracefully(app.path) { r = runVsctl(["launch", id, "--restore"]) }
-                    else { r.out += "\n\(app.name) no se cerró: ciérrala tú (Cmd+Q) y ábrela de nuevo." }
+                    else { r.out += "\n" + L("\(app.name) did not quit: quit it yourself (Cmd+Q) and open it again.", "\(app.name) no se cerró: ciérrala tú (Cmd+Q) y ábrela de nuevo.") }
                 }
                 return r
             }
         } else {
             let es = entries(app.path)
-            if es.count > 1 && !ask("¿Dejar de proteger \(app.name)?",
-                                    "También se quitarán sus accesos: " + es.map { $0.name }.joined(separator: ", ") + ".",
-                                    "Quitar", "Cancelar") { return }
+            if es.count > 1 && !ask(L("Stop protecting \(app.name)?", "¿Dejar de proteger \(app.name)?"),
+                                    L("Its launchers will be removed too: ", "También se quitarán sus accesos: ") + es.map { $0.name }.joined(separator: ", ") + ".",
+                                    L("Remove", "Quitar"), L("Cancel", "Cancelar")) { return }
             var restart = false
             if state == .tunnel || state == .blocked {
-                restart = ask("\(app.name) sigue dentro del túnel",
-                              "Mientras siga abierta, su tráfico continúa por Mullvad (o bloqueado si la VPN está apagada). Reiníciala para que use tu conexión normal.",
-                              "Reiniciar ahora", "Al cerrarla")
+                restart = ask(L("\(app.name) is still inside the tunnel", "\(app.name) sigue dentro del túnel"),
+                              L("While it stays open, its traffic keeps going through Mullvad (or stays blocked if the VPN is off). Restart it so it uses your normal connection.", "Mientras siga abierta, su tráfico continúa por Mullvad (o bloqueado si la VPN está apagada). Reiníciala para que use tu conexión normal."),
+                              L("Restart Now", "Reiniciar ahora"), L("When I Quit It", "Al cerrarla"))
             }
-            run("Quitando \(app.name)…") {
+            run(L("Removing \(app.name)…", "Quitando \(app.name)…")) {
                 var r: (ok: Bool, out: String) = (true, "")
                 for e in es { r = runVsctl(["app-remove", e.id]); if !r.ok { return r } }
                 if restart {
@@ -232,8 +232,8 @@ final class ControlModel: ObservableObject {
                             NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: app.path),
                                                                configuration: NSWorkspace.OpenConfiguration())
                         }
-                        r.out += "\n\(app.name) reabierta con tu conexión normal."
-                    } else { r.out += "\n\(app.name) no se cerró: ciérrala tú (Cmd+Q)." }
+                        r.out += "\n" + L("\(app.name) reopened with your normal connection.", "\(app.name) reabierta con tu conexión normal.")
+                    } else { r.out += "\n" + L("\(app.name) did not quit: quit it yourself (Cmd+Q).", "\(app.name) no se cerró: ciérrala tú (Cmd+Q).") }
                 }
                 return r
             }
@@ -285,7 +285,7 @@ struct ControlView: View {
             VStack(alignment: .leading, spacing: 10) {
                 location
                 Toggle(isOn: Binding(get: { m.autoVPN }, set: { m.setGlobalAuto($0) })) {
-                    Text("Auto-VPN: encender al abrir una app con ⚡ y apagar 2 min después de cerrarlas")
+                    Text(L("Auto-VPN: turn on when an app with ⚡ opens, and off 2 min after they are closed", "Auto-VPN: encender al abrir una app con ⚡ y apagar 2 min después de cerrarlas"))
                 }
                 .toggleStyle(.switch).disabled(!m.fresh)
                 warnings
@@ -336,17 +336,17 @@ struct ControlView: View {
             .map { ($0.key, $0.value[0].city) }.sorted { $0.1 < $1.1 }
         let servers = m.relays.filter { $0.loc == loc && $0.active }.map { $0.host }.sorted()
         return HStack(spacing: 8) {
-            Text("Ubicación").frame(width: 80, alignment: .leading)
+            Text(L("Location", "Ubicación")).frame(width: 80, alignment: .leading)
             Picker("", selection: Binding(get: { cc }, set: { m.select($0) })) {
                 if !countries.contains(where: { $0.0 == cc }) { Text(sel.isEmpty ? "—" : sel).tag(cc) }
                 ForEach(countries, id: \.0) { c in Text("\(flag(c.0))  \(c.1)").tag(c.0) }
             }.labelsHidden().frame(width: 210)
             Picker("", selection: Binding(get: { loc }, set: { m.select($0.isEmpty ? cc : $0) })) {
-                Text("Cualquier ciudad").tag("")
+                Text(L("Any city", "Cualquier ciudad")).tag("")
                 ForEach(cities, id: \.0) { c in Text(c.1).tag(c.0) }
             }.labelsHidden().frame(width: 190).disabled(cities.isEmpty)
             Picker("", selection: Binding(get: { host }, set: { m.select($0.isEmpty ? loc : $0) })) {
-                Text("Servidor automático").tag("")
+                Text(L("Automatic server", "Servidor automático")).tag("")
                 ForEach(servers, id: \.self) { Text($0).tag($0) }
             }.labelsHidden().frame(width: 170).disabled(loc.isEmpty)
         }
@@ -356,11 +356,11 @@ struct ControlView: View {
     @ViewBuilder var warnings: some View {
         if let s = m.status, m.fresh {
             if s.official_mullvad == "Connected" || s.official_mullvad == "Connecting" {
-                Label("El cliente oficial de Mullvad está conectado: todo el Mac va por la VPN.", systemImage: "exclamationmark.triangle")
+                Label(L("The official Mullvad app is connected: your whole Mac goes through the VPN.", "El cliente oficial de Mullvad está conectado: todo el Mac va por la VPN."), systemImage: "exclamationmark.triangle")
                     .foregroundColor(.orange).font(.callout)
             }
             if !s.configured {
-                Label("Importa tu configuración WireGuard de Mullvad (botón abajo).", systemImage: "key")
+                Label(L("Import your Mullvad WireGuard configuration (button below).", "Importa tu configuración WireGuard de Mullvad (botón abajo)."), systemImage: "key")
                     .foregroundColor(.orange).font(.callout)
             }
         }
@@ -377,23 +377,23 @@ struct ControlView: View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Apps").font(.headline)
-                Text("Marcadas: su tráfico (y el de sus procesos auxiliares) va por Mullvad. Desmarcadas: conexión normal.")
+                Text(L("Checked: its traffic (and that of its helper processes) goes through Mullvad. Unchecked: normal connection.", "Marcadas: su tráfico (y el de sus procesos auxiliares) va por Mullvad. Desmarcadas: conexión normal."))
                     .font(.caption).foregroundColor(.secondary)
             }
             Spacer()
-            Toggle("Solo marcadas", isOn: $onlyProtected).toggleStyle(.checkbox)
-            TextField("Buscar", text: $search).textFieldStyle(.roundedBorder).frame(width: 160)
-            Button { m.rescan() } label: { Image(systemName: "arrow.clockwise") }.help("Volver a leer /Applications")
+            Toggle(L("Checked only", "Solo marcadas"), isOn: $onlyProtected).toggleStyle(.checkbox)
+            TextField(L("Search", "Buscar"), text: $search).textFieldStyle(.roundedBorder).frame(width: 160)
+            Button { m.rescan() } label: { Image(systemName: "arrow.clockwise") }.help(L("Re-read /Applications", "Volver a leer /Applications"))
         }
     }
 
     var footer: some View {
         HStack(spacing: 8) {
-            Button("Comprobar IP") { m.delegate?.checkIP() }
-            Button("Autodiagnóstico") { m.delegate?.selftest() }
-            Button("Vigilar fugas") { m.delegate?.leakwatch() }
-            Button("Importar configuración…") { m.delegate?.importConfig() }
-            Button("Registro") { m.delegate?.openLog() }
+            Button(L("Check IP", "Comprobar IP")) { m.delegate?.checkIP() }
+            Button(L("Self-Test", "Autodiagnóstico")) { m.delegate?.selftest() }
+            Button(L("Watch for Leaks", "Vigilar fugas")) { m.delegate?.leakwatch() }
+            Button(L("Import Configuration…", "Importar configuración…")) { m.delegate?.importConfig() }
+            Button(L("Log", "Registro")) { m.delegate?.openLog() }
             Spacer()
             Text(m.message).font(.caption).foregroundColor(.secondary).lineLimit(2).frame(maxWidth: 220, alignment: .trailing)
         }
@@ -423,17 +423,17 @@ struct AppRow: View {
             }
             Spacer()
             if prot && state == .pendingIn {
-                Button("Reiniciar") { m.setProtected(app, true) }.controlSize(.small)
-                    .help("Cierra la app de forma ordenada y la reabre dentro del túnel")
+                Button(L("Restart", "Reiniciar")) { m.setProtected(app, true) }.controlSize(.small)
+                    .help(L("Quits the app cleanly and reopens it inside the tunnel", "Cierra la app de forma ordenada y la reabre dentro del túnel"))
             }
             Toggle("⚡", isOn: Binding(get: { m.isAuto(app.path) }, set: { m.setAuto(app, $0) }))
                 .toggleStyle(.checkbox)
                 .disabled(!prot || !m.autoVPN || m.busy != nil)
-                .help("Auto-VPN: abrir esta app enciende la VPN y cerrarla la apaga (tras 2 min)")
+                .help(L("Auto-VPN: opening this app turns the VPN on; closing it turns it off (after 2 min)", "Auto-VPN: abrir esta app enciende la VPN y cerrarla la apaga (tras 2 min)"))
             Toggle("", isOn: Binding(get: { prot }, set: { m.setProtected(app, $0) }))
                 .toggleStyle(.switch).labelsHidden()
                 .disabled(app.unsupported != nil || m.busy != nil || !m.fresh)
-                .help(prot ? "Marcada: va por Mullvad" : "Desmarcada: conexión normal")
+                .help(prot ? L("Checked: goes through Mullvad", "Marcada: va por Mullvad") : L("Unchecked: normal connection", "Desmarcada: conexión normal"))
         }
         .padding(.vertical, 2)
         .opacity(app.unsupported != nil ? 0.55 : 1)

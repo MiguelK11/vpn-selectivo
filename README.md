@@ -11,11 +11,12 @@ The official Mullvad app for Mac does the opposite: it puts your **whole** Mac o
 * ✅ **Auto-VPN**, globally and per app (⚡): opening certain apps turns the VPN on, closing them turns it off.
 * ✅ **Check/uncheck apps instantly**, no password needed; each protected app also gets an "‹App› VPN" Dock launcher. If the app is already running, you are offered a clean restart so it moves into (or out of) the tunnel.
 * ✅ **Apps opened "the wrong way"** (original Dock icon, Spotlight, a link) are closed instantly and reopened protected.
+* ✅ **English and Spanish** interface, following your Mac's language.
 * ✅ Free, small and auditable; compiled on your Mac from verified upstream sources — no third-party binaries.
 
 > ⚠️ Personal project, not audited by a third party, and not affiliated with Mullvad, WireGuard or VPNonly. Read the [limitations](#honest-limitations) before trusting it with anything important.
 >
-> 🌐 The app's interface is currently in **Spanish**; this documentation is in English. Button names are given below as they appear in the app, with a translation.
+> 🌐 The app is available in **English and Spanish** and follows your Mac's language. To pick a language for this app only: System Settings › General › Language & Region › Applications › VPN Selectivo.
 
 ---
 
@@ -42,14 +43,14 @@ The official Mullvad app for Mac does the opposite: it puts your **whole** Mac o
 
 ## Daily use
 
-Open **VPN Selectivo** from the Dock (or the menu-bar shield › *Abrir panel de control* — "Open control panel"):
+Open **VPN Selectivo** from the Dock (or the menu-bar shield › *Open Control Panel…*):
 
 * **VPN switch** (top right): turn it on and the tunnel stays up until you turn it off. Turn it off and **checked** apps lose Internet access (they never use your normal connection); unchecked apps are unaffected.
 * **Live status**: connected/disconnected, country, city, server, **real exit IP**, and which apps are going through the tunnel right now.
-* **Location** (*Ubicación*): country › city › server (or automatic). Changing it reconnects the tunnel by itself; during the switch, checked apps are blocked, not leaking.
+* **Location**: country › city › server (or automatic). Changing it reconnects the tunnel by itself; during the switch, checked apps are blocked, not leaking.
 * **Auto-VPN**: see below.
-* **Apps**: the list of `/Applications`, with search and a "checked only" filter (*Solo marcadas*). Each row shows whether the app is running and which way its traffic goes.
-* Buttons: *Comprobar IP* (check exit IP), *Autodiagnóstico* (self-test, includes deliberately dropping the tunnel), *Vigilar fugas* (watch for leaks), *Importar configuración* (import a Mullvad configuration) and *Registro* (log).
+* **Apps**: the list of `/Applications`, with search and a *Checked only* filter. Each row shows whether the app is running and which way its traffic goes.
+* Buttons: *Check IP*, *Self-Test* (includes deliberately dropping the tunnel), *Watch for Leaks*, *Import Configuration…* and *Log*.
 
 You can also open each app with its **"‹App› VPN"** launcher in `/Applications/VPN Selectivo/`. If you open a checked app with its original icon, it is closed instantly and reopened protected.
 
@@ -65,9 +66,9 @@ You can also open each app with its **"‹App› VPN"** launcher in `/Applicatio
 
 In the **Apps** list, turn an app's switch on to route it through Mullvad, or off to give it your normal connection. It is instant and needs no password.
 
-* **If the app is running** when you check it: for safety its route cannot change while it runs (that is decided at launch). Choose *Reiniciar ahora* ("Restart now" — it quits cleanly and reopens protected) or *Al cerrarla* ("When I close it" — it keeps your normal connection until you quit it; it is left alone meanwhile). Unchecking a running app works the same way in reverse.
+* **If the app is running** when you check it: for safety its route cannot change while it runs (that is decided at launch). Choose *Restart Now* (it quits cleanly and reopens protected) or *When I Quit It* (it keeps your normal connection until you quit it; it is left alone meanwhile). Unchecking a running app works the same way in reverse.
 * Apps that cannot be protected (Apple apps, other VPNs, Automator launchers) are dimmed and show the reason.
-* The menu-bar shield also has *Apps protegidas › Agregar / Quitar* (protected apps › add / remove).
+* The menu-bar shield also has *Protected Apps › Add / Remove*.
 
 ### From Terminal
 
@@ -101,7 +102,7 @@ Protection follows the app and **every process it creates**. It works very well 
 | Electron apps (Discord, Spotify, Slack…) | Apps with their own updater: the updater bypasses the VPN | Apps that need to see devices on your local network (Chromecast, AirPlay, printers), unless you set `ALLOW_LAN=1` |
 | Torrent clients (qBittorrent, Transmission), Stremio (torrent engine) | | |
 
-Always check a new app with *Vigilar fugas* (watch for leaks) while using it.
+Always check a new app with *Watch for Leaks* while using it.
 
 ## How it works
 
@@ -148,9 +149,9 @@ Details, the audit of VPNonly's engine and all test results are in [docs/TECHNIC
 
 ## Testing that it works
 
-* Control window › *Autodiagnóstico* (self-test): checks PF, the tunnel, Mullvad exit IP vs. direct IP, IPv6 and UDP, and deliberately drops the tunnel to confirm nothing leaks.
+* Control window › *Self-Test*: checks PF, the tunnel, Mullvad exit IP vs. direct IP, IPv6 and UDP, and deliberately drops the tunnel to confirm nothing leaks.
 * `tests/live-tests.sh`: opens your protected apps, checks that **all** their processes carry the group, and watches the physical interfaces (macOS PKTAP, by process and by "effective process").
-* `tests/unit.sh`: 70 tests of the logic, no root needed.
+* `tests/unit.sh`: 75 tests of the logic, no root needed.
 
 ## Updating and uninstalling
 
