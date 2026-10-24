@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>local.vpnselectivo.daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Library/VPNSelectivo/bin/vsctl</string>
+		<string>_daemon</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<!-- wireguard-go sobrevive a un reinicio del daemon (el estado lo reconoce) -->
+	<key>AbandonProcessGroup</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>3</integer>
+	<key>StandardErrorPath</key>
+	<string>/Library/Logs/VPNSelectivo-daemon.err</string>
+</dict>
+</plist>

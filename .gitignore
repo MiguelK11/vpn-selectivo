@@ -1,0 +1,11 @@
+# Compilación local (binarios: se generan con src/build.sh; wg es GPL-2.0)
+build/
+# Archivos generados por el instalador
+*.mobileconfig
+.config.tmp
+.sudoers.tmp
+# Nunca subir configuraciones WireGuard (contienen tu clave privada)
+*.conf
+!src/**/*.conf
+*.zip
+.DS_Store

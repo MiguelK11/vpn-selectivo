@@ -1,0 +1,1208 @@
+#!/bin/bash
+# vsctl — VPN Selectivo: controlador privilegiado (root).
+#
+# Pone las apps elegidas (etc/apps.conf; p. ej. Stremio y Brave) dentro de un
+# túnel WireGuard de Mullvad y deja el resto del Mac con su conexión normal.
+# Mecanismo:
+#   * las apps protegidas se lanzan con el grupo Unix dedicado "vpnselectivo"
+#     (vpnrun); sus procesos hijos lo heredan (helpers, motores como node…);
+#   * el anchor PF com.apple/vpnselectivo desvía con route-to todo el TCP/UDP
+#     IPv4 de ese grupo al utun de wireguard-go y BLOQUEA todo lo demás del
+#     grupo (IPv6, ICMP, cualquier tráfico si el túnel no está sano);
+#   * un daemon (vsctl _daemon, LaunchDaemon) vigila PF, el túnel y los
+#     lanzamientos "por fuera" de las apps protegidas, una vez por segundo.
+#
+# Lo invoca el usuario mediante una regla sudoers que solo permite ESTE
+# archivo; por eso cada argumento se valida y nada se lee de rutas del usuario
+# con privilegios de root.
+#
+# Idea y partes del diseño (anchor PF por grupo, route-to, parche NAT de
+# wireguard-go) provienen del motor MIT de VPNonly — ver third_party/.
+set -uo pipefail
+umask 022
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+LC_ALL=C
+export PATH LC_ALL
+
+BASE=/Library/VPNSelectivo
+BIN="$BASE/bin"
+ETC="$BASE/etc"
+SERVERS="$ETC/servers"
+RUN=/var/run/vpnselectivo
+TUN="$RUN/tunnel"
+FIFO="$RUN/control"
+STATUS="$RUN/status.json"
+EVENTS="$RUN/events.log"
+LOG=/Library/Logs/VPNSelectivo.log
+ANCHOR="com.apple/vpnselectivo"
+WG="$BIN/wg"
+WGGO="$BIN/wireguard-go"
+VPNRUN="$BIN/vpnrun"
+MULLVAD=/usr/local/bin/mullvad
+GROUP_NAME=vpnselectivo
+APPS_CONF="$ETC/apps.conf"
+LIBEXEC="$BASE/libexec"
+APPS_DIR="/Applications/VPN Selectivo"
+MULLVAD_SOCKS=10.64.0.1
+
+die() { echo "ERROR: $*" >&2; log "ERROR: $*"; exit 1; }
+log() {
+    [ -d /Library/Logs ] || return 0
+    printf '%s [%s] %s\n' "$(date '+%F %T')" "${CALLER:-?}" "$*" >> "$LOG" 2>/dev/null
+}
+
+[ "$(id -u)" = 0 ] || { echo "vsctl debe ejecutarse como root (sudo)" >&2; exit 1; }
+
+# ── configuración (solo archivos de root; nunca se hace `source`) ──────────────
+safe_root_file() {   # root, no escribible por grupo/otros, no symlink
+    [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    [ "$(stat -f '%u' "$1")" = 0 ] || return 1
+    local m; m=$(stat -f '%Lp' "$1")
+    [ $((8#$m & 022)) -eq 0 ]
+}
+VS_USER=""; ALLOW_LAN=0; IDLE_DOWN_SECONDS=120; ENFORCE=1; MTU=1380
+read_config() {
+    safe_root_file "$ETC/config" || die "configuración ausente o insegura: $ETC/config"
+    local k v line
+    while IFS= read -r line || [ -n "$line" ]; do
+        k=${line%%=*}; v=${line#*=}
+        case "$k" in
+            VS_USER)           [[ "$v" =~ ^[A-Za-z0-9._-]{1,64}$ ]] && VS_USER="$v" ;;
+            ALLOW_LAN)         [[ "$v" =~ ^[01]$ ]] && ALLOW_LAN="$v" ;;
+            ENFORCE)           [[ "$v" =~ ^[01]$ ]] && ENFORCE="$v" ;;
+            IDLE_DOWN_SECONDS) [[ "$v" =~ ^[0-9]{1,5}$ ]] && IDLE_DOWN_SECONDS="$v" ;;
+            MTU)               [[ "$v" =~ ^1[2-4][0-9][0-9]$ ]] && MTU="$v" ;;
+        esac
+    done < "$ETC/config"
+    [ -n "$VS_USER" ] && [ "$VS_USER" != root ] || die "VS_USER no válido en la configuración"
+    VS_UID=$(id -u "$VS_USER" 2>/dev/null) || die "usuario $VS_USER inexistente"
+    VS_GID=$(dscl . -read "/Groups/$GROUP_NAME" PrimaryGroupID 2>/dev/null | awk '{print $2}')
+    [[ "$VS_GID" =~ ^[0-9]+$ ]] && [ "$VS_GID" -ge 7300 ] && [ "$VS_GID" -le 7899 ] ||
+        die "grupo $GROUP_NAME ausente o fuera de rango"
+}
+read_config
+
+# Quién llama. Con sudo, solo el usuario configurado.
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+    [ "$SUDO_USER" = "$VS_USER" ] || die "solo $VS_USER puede usar vsctl"
+    CALLER="$SUDO_USER"
+else
+    CALLER=root
+fi
+
+ensure_rundir() {
+    if [ -L "$RUN" ]; then die "$RUN es un enlace simbólico"; fi
+    [ -d "$RUN" ] || mkdir -m 755 "$RUN"
+    chown root:wheel "$RUN"; chmod 755 "$RUN"
+    [ -d "$TUN" ] || mkdir -m 700 "$TUN"
+    chown root:wheel "$TUN"; chmod 700 "$TUN"
+}
+
+# ── utilidades de validación ──────────────────────────────────────────────────
+valid_ipv4() {
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    local o; for o in "${BASH_REMATCH[@]:1}"; do [ "$o" -le 255 ] || return 1; done
+}
+valid_key()   { [[ "$1" =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$ ]]; }
+valid_label() { [[ "$1" =~ ^[A-Za-z0-9._-]{1,64}$ ]] && [ "$1" != . ] && [ "$1" != .. ]; }
+valid_if()    { [[ "$1" =~ ^utun[0-9]{1,3}$ ]]; }
+valid_pid()   { [[ "$1" =~ ^[0-9]{1,7}$ ]] && [ "$1" -gt 1 ]; }
+
+# ── PF ────────────────────────────────────────────────────────────────────────
+pf_enabled() { pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; }
+pf_hook_ok() { pfctl -s rules 2>/dev/null | grep -Eq '^anchor "com\.apple/\*" all$'; }
+
+# El conjunto principal de Apple (/etc/pf.conf) evalúa los anchors com.apple/*.
+# Solo se carga si el conjunto principal está VACÍO: nunca se reemplazan reglas
+# de otro programa (p. ej. el anchor del cliente oficial de Mullvad).
+pf_bootstrap_hook() {
+    pf_hook_ok && return 0
+    [ -z "$(pfctl -s rules 2>/dev/null)" ] || return 1
+    grep -Eq '^anchor "com\.apple/\*"' /etc/pf.conf 2>/dev/null || return 1
+    pfctl -q -f /etc/pf.conf 2>/dev/null && log "PF: cargado el conjunto principal de Apple (/etc/pf.conf)"
+    pf_hook_ok
+}
+
+# Mantiene una referencia propia (token) de PF: si otro programa libera la suya
+# con -X, PF sigue activo. Un `pfctl -d` ajeno lo apaga igualmente; eso lo
+# detecta y repara el daemon.
+pf_ensure_enabled() {
+    local tok=""
+    [ -f "$RUN/pf-token" ] && tok=$(cat "$RUN/pf-token" 2>/dev/null)
+    if [[ "$tok" =~ ^[0-9]+$ ]] && pf_enabled &&
+       pfctl -s References 2>/dev/null | grep -qw "$tok"; then
+        return 0
+    fi
+    local out; out=$(pfctl -E 2>&1)
+    tok=$(printf '%s\n' "$out" | awk '/Token/ {print $NF; exit}')
+    if [[ "$tok" =~ ^[0-9]+$ ]]; then
+        (umask 077; printf '%s\n' "$tok" > "$RUN/pf-token")
+    fi
+    pf_enabled
+}
+
+physical_ifs() { ifconfig -l | tr ' ' '\n' | grep -E '^(en|bridge)[0-9]+$' | tr '\n' ' '; }
+
+# Redes locales privadas (/16 o más estrechas) y sus routers, para ALLOW_LAN=1.
+lan_rules() {
+    local G="$1" ifn addr mask m prefix a b c d net n1 n2 cidr gw gws
+    ifconfig -a 2>/dev/null | awk '
+        /^[^[:space:]]/ { split($1, n, ":"); ifn = n[1] }
+        $1 == "inet" && $3 == "netmask" && ifn ~ /^(en|bridge)[0-9]+$/ { print ifn, $2, $4 }' |
+    while read -r ifn addr mask; do
+        valid_ipv4 "$addr" || continue
+        [[ "$mask" =~ ^0x[0-9a-f]{8}$ ]] || continue
+        m=$((16#${mask#0x})); prefix=0
+        while [ "$prefix" -lt 32 ] && [ $(( (m >> (31 - prefix)) & 1 )) -eq 1 ]; do prefix=$((prefix + 1)); done
+        [ "$prefix" -ge 16 ] || continue
+        IFS=. read -r a b c d <<< "$addr"
+        net=$(( ((a << 24) | (b << 16) | (c << 8) | d) & m ))
+        n1=$(( (net >> 24) & 255 )); n2=$(( (net >> 16) & 255 ))
+        if [ "$n1" -eq 10 ] || { [ "$n1" -eq 172 ] && [ "$n2" -ge 16 ] && [ "$n2" -le 31 ]; } ||
+           { [ "$n1" -eq 192 ] && [ "$n2" -eq 168 ]; }; then :; else continue; fi
+        cidr="$n1.$n2.$(( (net >> 8) & 255 )).$(( net & 255 ))/$prefix"
+        # El router queda inaccesible: su DNS, UPnP o NAT-PMP revelarían
+        # nombres consultados o la IP pública real.
+        gws=$({ ipconfig getoption "$ifn" router 2>/dev/null; echo
+                route -n get -ifscope "$ifn" default 2>/dev/null | awk '$1=="gateway:"{print $2}'; } | sort -u)
+        for gw in $gws; do
+            valid_ipv4 "$gw" && echo "block return out quick on ! lo0 inet from any to $gw group $G"
+        done
+        echo "pass out quick on ! lo0 inet proto { tcp udp } from $addr to $cidr group $G keep state"
+    done
+    echo "pass out quick on ! lo0 inet proto { tcp udp } from 169.254.0.0/16 to 169.254.0.0/16 group $G keep state"
+    echo "pass out quick on ! lo0 inet proto udp from any to 224.0.0.0/4 group $G keep state"
+}
+
+gen_rules() {   # $1 = route|block
+    local mode="$1" G="$VS_GID" phys IF IP
+    phys=$(physical_ifs)
+    echo "# VPN Selectivo — modo $mode — generado $(date '+%F %T')"
+    [ "$ALLOW_LAN" = 1 ] && lan_rules "$G"
+    if [ "$mode" = route ]; then
+        IF=$(cat "$TUN/ifname"); IP=$(cat "$TUN/ip")
+        valid_if "$IF" && valid_ipv4 "$IP" || return 1
+        echo "pass out quick on ! lo0 route-to ($IF $IP) inet proto { tcp udp } from any to any group $G keep state"
+    fi
+    # Todo lo demás del grupo, IPv6/ICMP incluidos, falla cerrado. "return"
+    # (RST / ICMP unreachable) para que las apps fallen al instante.
+    echo "block return out quick on ! lo0 from any to any group $G"
+    # El proxy SOCKS interno de Mullvad solo existe dentro de un túnel: ningún
+    # proceso debe intentar alcanzarlo por un enlace físico (Brave lanzado por
+    # fuera con la política opcional de proxy).
+    [ -n "$phys" ] && echo "block return out quick on { $phys} inet proto tcp from any to $MULLVAD_SOCKS port 1080"
+    return 0
+}
+
+pf_load() {   # $1 = route|block
+    local mode="$1" f
+    f=$(mktemp "$RUN/.pf.XXXXXX") || return 1
+    if ! gen_rules "$mode" > "$f"; then rm -f "$f"; return 1; fi
+    if ! pfctl -o none -n -a "$ANCHOR" -f "$f" >/dev/null 2>&1; then
+        log "PF: las reglas generadas no validan"; rm -f "$f"; return 1
+    fi
+    if ! pfctl -o none -q -a "$ANCHOR" -f "$f" 2>/dev/null; then
+        log "PF: no se pudo cargar el anchor"; rm -f "$f"; return 1
+    fi
+    rm -f "$f"
+    pfctl -a "$ANCHOR" -s rules 2>/dev/null > "$RUN/anchor.expected"
+    echo "$mode" > "$RUN/mode"
+    LAN_SIG=$(lan_signature)
+    return 0
+}
+
+anchor_ok() {
+    [ -s "$RUN/anchor.expected" ] || return 1
+    [ "$(pfctl -a "$ANCHOR" -s rules 2>/dev/null)" = "$(cat "$RUN/anchor.expected")" ]
+}
+pf_protected() { pf_enabled && pf_hook_ok && anchor_ok; }
+lan_signature() {
+    [ "$ALLOW_LAN" = 1 ] || { echo off; return; }
+    { ifconfig -a | grep -E '^\s*inet ' ; netstat -rn -f inet | awk '$1=="default"'; } 2>/dev/null | cksum
+}
+
+# ── túnel WireGuard ───────────────────────────────────────────────────────────
+tunnel_alive() {
+    local pid ifn
+    [ -f "$TUN/pid" ] && [ -f "$TUN/ifname" ] && [ -f "$TUN/ip" ] || return 1
+    pid=$(cat "$TUN/pid"); ifn=$(cat "$TUN/ifname")
+    valid_pid "$pid" && valid_if "$ifn" || return 1
+    [ "$(ps -o uid= -p "$pid" 2>/dev/null | tr -d ' ')" = 0 ] || return 1
+    [ "$(ps -o command= -p "$pid" 2>/dev/null | sed 's/^ *//')" = "$WGGO -f utun" ] || return 1
+    ifconfig "$ifn" >/dev/null 2>&1 && [ -S "/var/run/wireguard/$ifn.sock" ]
+}
+
+# Detiene solo el wireguard-go que nuestro estado identifica, nunca por nombre.
+tunnel_kill_recorded() {
+    local pid ifn i=0
+    pid=$(cat "$TUN/pid" 2>/dev/null); ifn=$(cat "$TUN/ifname" 2>/dev/null)
+    if valid_pid "$pid" && [ "$(ps -o command= -p "$pid" 2>/dev/null | sed 's/^ *//')" = "$WGGO -f utun" ]; then
+        kill -TERM "$pid" 2>/dev/null
+        while kill -0 "$pid" 2>/dev/null && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    fi
+    if valid_if "$ifn"; then
+        i=0; while ifconfig "$ifn" >/dev/null 2>&1 && [ $i -lt 20 ]; do sleep 0.1; i=$((i + 1)); done
+        ifconfig "$ifn" >/dev/null 2>&1 || rm -f "/var/run/wireguard/$ifn.sock"
+    fi
+    rm -f "$TUN"/pid "$TUN"/ifname "$TUN"/ip "$TUN"/server "$TUN"/started "$TUN"/.name.* "$TUN"/.wgset.*
+}
+
+# ── servidores y ubicaciones ─────────────────────────────────────────────────
+# Todas las configuraciones WireGuard de una cuenta Mullvad comparten clave
+# privada e IP de túnel; solo cambia el servidor (clave pública + IP). Por eso
+# basta UNA configuración importada (la "identidad") y la lista pública de
+# servidores de Mullvad, que no requiere cuenta.
+RELAYS="$ETC/relays.tsv"            # host loc país ciudad activo en_país peso ipv4 clave
+RELAYS_JS="$BIN/relays2tsv.js"
+RELAYS_URL="https://api.mullvad.net/public/relays/wireguard/v2/"
+
+identity_label() {   # primera configuración importada válida
+    local f l
+    for f in "$SERVERS"/*.conf; do
+        l=$(basename "$f" .conf)
+        valid_label "$l" && read_server "$l" && { echo "$l"; return 0; }
+    done
+    return 1
+}
+
+valid_location() { [[ "$1" =~ ^[a-z]{2}(-[a-z]{3})?$ ]]; }
+relays_ok() { safe_root_file "$RELAYS" && [ -s "$RELAYS" ]; }
+
+# Lo elegido: código de país ("us"), de ciudad ("us-nyc"), servidor
+# ("us-nyc-wg-301") o una configuración importada.
+selected_value() {
+    local s=""
+    [ -f "$ETC/selected" ] && s=$(head -n1 "$ETC/selected")
+    if valid_label "$s" && { [ -f "$SERVERS/$s.conf" ] ||
+         { relays_ok && awk -F'\t' -v s="$s" '$1 == s || $2 == s || substr($2, 1, 2) == s {f=1; exit} END {exit !f}' "$RELAYS"; }; }; then
+        echo "$s"; return 0
+    fi
+    identity_label
+}
+selected_server() { selected_value; }   # compatibilidad
+
+# Candidatos "host endpoint clave" (máx. 3) para lo elegido. En país/ciudad se
+# sortean servidores activos ponderados por su peso, como la app oficial.
+candidates() {
+    local sel="$1"
+    if relays_ok; then
+        awk -F'\t' -v s="$sel" -v seed="$RANDOM" '
+            BEGIN { srand(seed) }
+            $5 == 1 && ($1 == s || $2 == s || (length(s) == 2 && substr($2, 1, 2) == s && $6 == 1)) {
+                w = ($7 > 0 ? $7 : 1); printf "%.6f %s %s:51820 %s\n", -log(1 - rand()) / w, $1, $8, $9 }' "$RELAYS" |
+            sort -n | head -n 3 | cut -d' ' -f2- | grep . && return 0
+    fi
+    # Configuración importada, o lista de servidores aún no descargada. Una
+    # ubicación sin servidores activos NO cae en otro país: falla.
+    if read_server "$sel" 2>/dev/null; then echo "$sel $ENDPOINT $PEER_PUBLIC_KEY"; return 0; fi
+    relays_ok && return 1
+    read_server "$(identity_label)" || return 1
+    echo "$(identity_label) $ENDPOINT $PEER_PUBLIC_KEY"
+}
+
+relays_update() {
+    local json tsv n=0 h loc country city act inc w ip pk
+    json=$(mktemp "$RUN/.relays.json.XXXXXX") || return 1
+    tsv=$(mktemp "$RUN/.relays.tsv.XXXXXX") || { rm -f "$json"; return 1; }
+    if ! curl -fsS --proto =https --max-time 20 --max-filesize 5000000 -o "$json" "$RELAYS_URL"; then
+        rm -f "$json" "$tsv"; log "no se pudo descargar la lista de servidores"; return 1
+    fi
+    # Cada campo se valida antes de que llegue a una configuración WireGuard.
+    while IFS=$'\t' read -r h loc country city act inc w ip pk; do
+        [[ "$h" =~ ^[a-z]{2}-[a-z]{3}-wg-[a-z0-9-]{1,12}$ ]] && [[ "$loc" =~ ^[a-z]{2}-[a-z]{3}$ ]] &&
+        [ "${h:0:6}" = "$loc" ] && [[ "$act" =~ ^[01]$ ]] && [[ "$inc" =~ ^[01]$ ]] &&
+        [[ "$w" =~ ^[0-9]{1,6}$ ]] && valid_ipv4 "$ip" && valid_key "$pk" &&
+        [ -n "$country" ] && [ ${#country} -le 60 ] && [ -n "$city" ] && [ ${#city} -le 60 ] || continue
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$h" "$loc" "$country" "$city" "$act" "$inc" "$w" "$ip" "$pk" >> "$tsv"
+        n=$((n + 1))
+    done < <(osascript -l JavaScript "$RELAYS_JS" "$json" 2>/dev/null)
+    rm -f "$json"
+    if [ "$n" -lt 50 ]; then
+        rm -f "$tsv"; log "lista de servidores rechazada ($n entradas válidas)"; return 1
+    fi
+    chmod 644 "$tsv"; chown root:wheel "$tsv"; mv -f "$tsv" "$RELAYS"
+    log "lista de servidores actualizada: $n servidores"
+    echo "$n"
+}
+
+read_server() {   # $1 = etiqueta → PRIVATE_KEY ADDRESS4 PEER_PUBLIC_KEY ENDPOINT
+    local f="$SERVERS/$1.conf" k v
+    PRIVATE_KEY=""; ADDRESS4=""; PEER_PUBLIC_KEY=""; ENDPOINT=""
+    safe_root_file "$f" || return 1
+    # Sin IFS='=': bash quitaría el "=" final de las claves base64.
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        k=${line%%=*}; v=${line#*=}
+        case "$k" in
+            PRIVATE_KEY) PRIVATE_KEY="$v" ;;  ADDRESS4) ADDRESS4="$v" ;;
+            PEER_PUBLIC_KEY) PEER_PUBLIC_KEY="$v" ;;  ENDPOINT) ENDPOINT="$v" ;;
+        esac
+    done < "$f"
+    valid_key "$PRIVATE_KEY" && valid_key "$PEER_PUBLIC_KEY" && valid_ipv4 "$ADDRESS4" &&
+        [[ "$ENDPOINT" =~ ^([0-9.]+):([0-9]{1,5})$ ]] && valid_ipv4 "${BASH_REMATCH[1]}"
+}
+
+LAST_ERROR=""
+tunnel_up() {
+    tunnel_alive && return 0
+    tunnel_kill_recorded
+    local sel ident cands pid ifn i wgset namef hs host ep pk label=""
+    ident=$(identity_label) || { LAST_ERROR=no_config; return 1; }
+    read_server "$ident" || { LAST_ERROR=bad_config; return 1; }
+    local key="$PRIVATE_KEY" addr="$ADDRESS4"
+    sel=$(selected_value) || sel="$ident"
+    cands=$(candidates "$sel") || { LAST_ERROR=no_server; log "ningún servidor activo para '$sel'"; return 1; }
+    [ -x "$WGGO" ] && [ -x "$WG" ] || { LAST_ERROR=missing_binaries; return 1; }
+
+    namef=$(mktemp "$TUN/.name.XXXXXX") || return 1
+    WG_TUN_NAME_FILE="$namef" WG_NAT_SOURCE="$addr" "$WGGO" -f utun </dev/null >>"$RUN/wireguard-go.log" 2>&1 &
+    pid=$!
+    echo "$pid" > "$TUN/pid"
+    i=0; while [ ! -s "$namef" ] && [ $i -lt 50 ]; do
+        kill -0 "$pid" 2>/dev/null || break; sleep 0.1; i=$((i + 1)); done
+    ifn=$(cat "$namef" 2>/dev/null); rm -f "$namef"
+    if ! valid_if "$ifn"; then LAST_ERROR=wg_start_failed; log "wireguard-go no creó interfaz"; tunnel_kill_recorded; return 1; fi
+    echo "$ifn" > "$TUN/ifname"
+    i=0; while { [ ! -S "/var/run/wireguard/$ifn.sock" ] || ! "$WG" show "$ifn" >/dev/null 2>&1; } && [ $i -lt 50 ]; do
+        sleep 0.1; i=$((i + 1)); done
+    # Sin rutas: el sistema no envía nada a este utun salvo lo que PF desvía.
+    ifconfig "$ifn" inet "$addr" "$addr" netmask 255.255.255.255 mtu "$MTU" up ||
+        { LAST_ERROR=wg_config_failed; tunnel_kill_recorded; return 1; }
+    echo "$addr" > "$TUN/ip"
+
+    # Probar candidatos hasta obtener handshake (setconf reemplaza el servidor).
+    while read -r host ep pk; do
+        valid_key "$pk" && [[ "$ep" =~ ^[0-9.]+:[0-9]{1,5}$ ]] || continue
+        # La clave privada solo pasa por un archivo de root 600, nunca por argv.
+        wgset=$(mktemp "$TUN/.wgset.XXXXXX") || break
+        printf '[Interface]\nPrivateKey = %s\n[Peer]\nPublicKey = %s\nEndpoint = %s\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 1\n' \
+            "$key" "$pk" "$ep" > "$wgset"
+        "$WG" setconf "$ifn" "$wgset"; rm -f "$wgset"
+        hs=0; i=0
+        while [ $i -lt 60 ]; do   # keepalive de 1 s fuerza el handshake inmediato
+            hs=$("$WG" show "$ifn" latest-handshakes 2>/dev/null | awk '{print $2+0; exit}')
+            [ "${hs:-0}" -gt 0 ] && break
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1; i=$((i + 1))
+        done
+        if [ "${hs:-0}" -gt 0 ]; then
+            "$WG" set "$ifn" peer "$pk" persistent-keepalive 25; label="$host"; break
+        fi
+        log "sin handshake con $host ($ep); probando otro servidor"
+    done <<< "$cands"
+    if [ -z "$label" ]; then
+        LAST_ERROR=handshake_failed; tunnel_kill_recorded; return 1
+    fi
+    echo "$label" > "$TUN/server"; date +%s > "$TUN/started"
+    if ! pf_load route; then
+        LAST_ERROR=pf_failed; pf_load block; tunnel_kill_recorded; return 1
+    fi
+    LAST_ERROR=""
+    log "túnel arriba: $label en $ifn ($addr), elegido '$sel'"
+    return 0
+}
+
+tunnel_down() {   # primero bloquear, después destruir
+    local ifn; ifn=$(cat "$TUN/ifname" 2>/dev/null)
+    pf_load block || log "ADVERTENCIA: no se pudo cargar el modo bloqueo"
+    valid_if "$ifn" && pfctl -i "$ifn" -F states >/dev/null 2>&1
+    tunnel_kill_recorded
+    log "túnel abajo"
+}
+
+# ── procesos ──────────────────────────────────────────────────────────────────
+# Imprime "pid uid rgid ruta" de todos los procesos.
+proc_table() {
+    ps -axo pid=,uid=,rgid=,comm= 2>/dev/null |
+        awk '{ if (match($0, /^ *[0-9]+ +[0-9]+ +[0-9]+ /)) print $1, $2, $3, substr($0, RLENGTH + 1) }'
+}
+# ── apps protegidas (etc/apps.conf) ──────────────────────────────────────────
+# Una línea por app:   id | Nombre | /Applications/App.app | argumentos | auto
+# "auto" (1 por defecto, 0 = no): abrir la app enciende el túnel (Auto-VPN).
+# Varias líneas pueden apuntar a la misma app con argumentos distintos (p. ej.
+# "brave-private | Brave Privado | /Applications/Brave Browser.app | --incognito").
+# Lo procesos que macOS lanza por su cuenta dentro del bundle (actualizadores,
+# notificaciones, lanzadores de PWA) no se tratan como "lanzados por fuera".
+EXCLUDE_RE='Updater|Update\.app|Autoupdate|Sparkle|ShipIt|Helper \((Aperitif )?Alerts\)|app_mode_loader|web_app_shortcut_copier'
+APP_ID=(); APP_NAME=(); APP_PATH=(); APP_ARGS=(); APP_EXE=(); APP_BID=(); APP_AUTO=()
+APPS_MTIME=""
+GRACE="$RUN/grace"          # pids abiertos sin VPN que se dejan vivir hasta cerrarlos
+AUTO_FILE="$ETC/auto-vpn"   # Auto-VPN global: 1 (por defecto) o 0
+
+valid_app_id()   { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]]; }
+valid_app_name() { [ -n "$1" ] && [ ${#1} -le 40 ] && [[ "$1" != *[\"\'\\\$\`/\|\<\>\;\&]* ]] && [[ "$1" =~ ^[^[:cntrl:]]+$ ]]; }
+valid_app_path() {
+    [[ "$1" =~ ^/Applications/[^/]+\.app$ || "$1" =~ ^/Users/[A-Za-z0-9._-]+/Applications/[^/]+\.app$ ]] &&
+        [[ "$1" != *..* ]] && [[ "$1" != *[\"\'\\\$\`\|]* ]] && [[ "$1" =~ ^[^[:cntrl:]]+$ ]]
+}
+valid_app_args() { local a; for a in $1; do [[ "$a" =~ ^--?[A-Za-z0-9][A-Za-z0-9._=:-]*$ ]] || return 1; done; [ "$(echo $1 | wc -w)" -le 4 ]; }
+trim() { local x="$1"; x="${x#"${x%%[![:space:]]*}"}"; echo "${x%"${x##*[![:space:]]}"}"; }
+
+bundle_key() { /usr/libexec/PlistBuddy -c "Print :$2" "$1/Contents/Info.plist" 2>/dev/null; }
+
+load_apps() {   # recarga solo si apps.conf cambió
+    local m line id name path args auto exe bid
+    m=$(stat -f %m "$APPS_CONF" 2>/dev/null || echo none)
+    [ "$m" = "$APPS_MTIME" ] && return 0
+    APPS_MTIME="$m"; APP_ID=(); APP_NAME=(); APP_PATH=(); APP_ARGS=(); APP_EXE=(); APP_BID=(); APP_AUTO=()
+    safe_root_file "$APPS_CONF" || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%%#*}; [[ "$line" == *"|"*"|"* ]] || continue
+        IFS='|' read -r id name path args auto <<< "$line"
+        id=$(trim "$id"); name=$(trim "$name"); path=$(trim "$path"); args=$(trim "${args:-}"); auto=$(trim "${auto:-1}")
+        [[ "$auto" =~ ^[01]$ ]] || auto=1
+        valid_app_id "$id" && valid_app_name "$name" && valid_app_path "$path" && valid_app_args "$args" ||
+            { log "apps.conf: línea ignorada: $line"; continue; }
+        exe=$(bundle_key "$path" CFBundleExecutable); bid=$(bundle_key "$path" CFBundleIdentifier)
+        [[ "$exe" =~ ^[^/[:cntrl:]]+$ ]] && [[ "$bid" =~ ^[A-Za-z0-9.-]+$ ]] ||
+            { log "apps.conf: $path no es una app válida (¿no instalada?)"; continue; }
+        APP_ID+=("$id"); APP_NAME+=("$name"); APP_PATH+=("$path"); APP_ARGS+=("$args")
+        APP_EXE+=("$path/Contents/MacOS/$exe"); APP_BID+=("$bid"); APP_AUTO+=("$auto")
+    done < "$APPS_CONF"
+}
+app_index() { local i; for i in "${!APP_ID[@]}"; do [ "${APP_ID[$i]}" = "$1" ] && { echo "$i"; return 0; }; done; return 1; }
+unique_paths() { printf '%s\n' ${APP_PATH[@]+"${APP_PATH[@]}"} | awk 'NF && !seen[$0]++'; }
+is_chromium() { ls "$1"/Contents/Frameworks/*/Versions/*/Helpers/chrome_crashpad_handler >/dev/null 2>&1; }
+
+# Clasifica la ruta de un proceso: devuelve la ruta del bundle protegido al que
+# pertenece, o "" (las rutas de los bundles llegan por ENVIRON).
+classify_awk='
+BEGIN { np = split(ENVIRON["VS_PATHS"], P, "\n") }
+function cls(p,   i) {
+    if (p ~ ENVIRON["VS_EXCLUDE"]) return ""
+    for (i = 1; i <= np; i++) if (P[i] != "" && index(p, P[i] "/Contents/") == 1) return P[i]
+    return ""
+}'
+with_paths() { VS_PATHS="$(unique_paths)" VS_EXCLUDE="$EXCLUDE_RE" "$@"; }
+
+# Procesos de apps protegidas del usuario que NO llevan el grupo: lanzados por
+# fuera (Dock, Spotlight, actualización, inicio de sesión...).
+stray_pids() {   # $1 = any | ruta del bundle   $2 = all → incluir los que están en gracia
+    [ ${#APP_PATH[@]} -gt 0 ] || return 0
+    local graced=""
+    [ "${2:-}" != all ] && [ -s "$GRACE" ] && graced=$(tr '\n' ' ' < "$GRACE")
+    # Tabla con ppid para respetar la gracia también en los hijos de un proceso agraciado.
+    ps -axo pid=,ppid=,uid=,rgid=,comm= 2>/dev/null |
+        awk '{ if (match($0, /^ *[0-9]+ +[0-9]+ +[0-9]+ +[0-9]+ /)) print $1, $2, $3, $4, substr($0, RLENGTH + 1) }' |
+        with_paths awk -v uid="$VS_UID" -v gid="$VS_GID" -v want="$1" -v graced=" $graced " "$classify_awk"'
+        { pid=$1; pp[pid]=$2; u[pid]=$3; g[pid]=$4; $1=$2=$3=$4=""; sub(/^ +/, ""); path[pid]=$0; ord[++n]=pid }
+        END {
+            for (i = 1; i <= n; i++) {
+                p = ord[i]; c = cls(path[p])
+                if (c == "" || u[p] != uid || g[p] == gid || (want != "any" && want != c)) continue
+                q = p; ok = 1
+                for (d = 0; d < 12 && q > 1; d++) { if (index(graced, " " q " ")) { ok = 0; break }; q = pp[q] }
+                if (ok) print p
+            }
+        }'
+}
+grace_cleanup() {   # olvidar pids que ya no existen
+    [ -s "$GRACE" ] || return 0
+    local p keep=""
+    while read -r p; do valid_pid "$p" && kill -0 "$p" 2>/dev/null && keep="$keep$p"$'\n'; done < "$GRACE"
+    printf '%s' "$keep" > "$GRACE"
+}
+auto_vpn_on() { [ "$(cat "$AUTO_FILE" 2>/dev/null || echo 1)" != 0 ]; }
+auto_paths() {   # apps cuya apertura enciende el túnel
+    local i; for i in "${!APP_ID[@]}"; do [ "${APP_AUTO[$i]}" = 1 ] && echo "${APP_PATH[$i]}"; done | awk '!seen[$0]++'
+}
+auto_group_count() {   # procesos con el grupo que pertenecen a apps con Auto-VPN
+    auto_vpn_on || { echo 0; return; }
+    local ap; ap=$(auto_paths); [ -n "$ap" ] || { echo 0; return; }
+    proc_table | VS_PATHS="$ap" VS_EXCLUDE="$EXCLUDE_RE" awk -v gid="$VS_GID" "$classify_awk"'
+        $3 == gid { $1=$2=$3=""; sub(/^ +/, ""); if (cls($0) != "") n++ } END { print n+0 }'
+}
+group_main_running() {   # $1 = ejecutable principal: ¿corre dentro del grupo?
+    proc_table | awk -v gid="$VS_GID" -v want="$1" '
+        $3 == gid { $1=$2=$3=""; sub(/^ +/, ""); if ($0 == want) f=1 } END { exit !f }'
+}
+count_group() {   # → nº total de procesos con el grupo
+    proc_table | awk -v gid="$VS_GID" '$3 == gid { n++ } END { print n+0 }'
+}
+running_apps() {   # ids (uno por app) cuya app principal corre dentro del grupo
+    local i seen="" out="" tbl
+    tbl=$(proc_table | awk -v gid="$VS_GID" '$3 == gid { $1=$2=$3=""; sub(/^ +/, ""); print }')
+    for i in "${!APP_ID[@]}"; do
+        [[ " $seen " == *" ${APP_PATH[$i]} "* ]] && continue
+        if grep -qxF "${APP_EXE[$i]}" <<< "$tbl"; then out="$out${out:+,}${APP_ID[$i]}"; seen="$seen ${APP_PATH[$i]}"; fi
+    done
+    echo "$out"
+}
+event() { printf '%s %s %s\n' "$(date +%s)" "$1" "${2:--}" >> "$EVENTS"; chmod 644 "$EVENTS"; }
+
+notify_user() {   # notificación en la sesión gráfica del usuario
+    pgrep -u "$VS_UID" -f 'VPN Selectivo.app/Contents/MacOS/' >/dev/null 2>&1 && return 0  # la app de menú ya avisa
+    launchctl asuser "$VS_UID" sudo -u "$VS_USER" osascript \
+        -e 'on run argv' -e 'display notification (item 1 of argv) with title "VPN Selectivo"' -e 'end run' \
+        "$1" >/dev/null 2>&1 &
+}
+
+# Para un proceso lanzado por fuera, ¿qué entrada de apps.conf lo reabre?
+# La que comparte bundle y cuyos argumentos aparecen en su línea de órdenes
+# (p. ej. --incognito); si no, la entrada sin argumentos.
+entry_for_stray() {   # $1 = ruta del bundle  $2 = argumentos del proceso
+    local i best="" a ok
+    for i in "${!APP_ID[@]}"; do
+        [ "${APP_PATH[$i]}" = "$1" ] || continue
+        if [ -n "${APP_ARGS[$i]}" ]; then
+            ok=1; for a in ${APP_ARGS[$i]}; do [[ " $2 " == *" $a "* ]] || ok=0; done
+            [ $ok = 1 ] && { echo "${APP_ID[$i]}"; return; }
+        elif [ -z "$best" ]; then best="${APP_ID[$i]}"; fi
+    done
+    echo "${best:-}"
+}
+
+kill_strays() {   # $1 = any|ruta del bundle  $2 = quiet → nº de procesos terminados
+    local pids n=0 p comm path ids="" id
+    pids=$(stray_pids "$1")
+    [ -n "$pids" ] || { echo 0; return; }
+    for p in $pids; do
+        comm=$(ps -o comm= -p "$p" 2>/dev/null)
+        path=$(with_paths awk "$classify_awk"' { print cls($0) }' <<< "$comm")
+        # Solo el ejecutable principal decide qué reabrir (los helpers mueren con él).
+        if [ -n "$path" ] && [ "$comm" = "$path/Contents/MacOS/$(bundle_key "$path" CFBundleExecutable)" ]; then
+            id=$(entry_for_stray "$path" "$(ps -o args= -p "$p" 2>/dev/null)")
+            [ -n "$id" ] && [[ " $ids " != *" $id "* ]] && ids="$ids $id"
+        fi
+        kill -KILL "$p" 2>/dev/null && n=$((n + 1))
+    done
+    if [ "${2:-}" != quiet ]; then
+        for id in $ids; do event stray "$id"; done
+    fi
+    log "procesos lanzados fuera de la VPN terminados ($n):$ids"
+    echo "$n"
+}
+
+# Íconos del Dock: un lanzador "<Nombre> VPN.app" por entrada de apps.conf.
+app_sync() {   # $1 = full → regenerar todos los lanzadores
+    local i dir icon iconf color lid full="${1:-}"
+    [ -x "$LIBEXEC/launcher" ] && [ -x "$LIBEXEC/makeicon" ] || die "faltan componentes (libexec); reinstala"
+    mkdir -p "$APPS_DIR"
+    for dir in "$APPS_DIR"/*" VPN.app"; do   # retirar lanzadores de apps quitadas
+        [ -d "$dir" ] || continue
+        lid=$(/usr/libexec/PlistBuddy -c 'Print :VSLaunchApp' "$dir/Contents/Info.plist" 2>/dev/null)
+        app_index "$lid" >/dev/null || rm -rf "$dir"
+    done
+    for i in "${!APP_ID[@]}"; do
+        dir="$APPS_DIR/${APP_NAME[$i]} VPN.app"
+        if [ "$full" != full ] && [ -x "$dir/Contents/MacOS/launcher" ] &&
+           [ "$(/usr/libexec/PlistBuddy -c 'Print :VSLaunchApp' "$dir/Contents/Info.plist" 2>/dev/null)" = "${APP_ID[$i]}" ]; then
+            continue
+        fi
+        rm -rf "$dir"; mkdir -p "$dir/Contents/MacOS" "$dir/Contents/Resources"
+        install -m 0755 "$LIBEXEC/launcher" "$dir/Contents/MacOS/launcher"
+        /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string local.vpnselectivo.launch.${APP_ID[$i]}" \
+            -c "Add :CFBundleName string ${APP_NAME[$i]} VPN" -c "Add :CFBundleDisplayName string ${APP_NAME[$i]} VPN" \
+            -c "Add :CFBundleExecutable string launcher" -c "Add :CFBundleIconFile string icon" \
+            -c "Add :CFBundlePackageType string APPL" -c "Add :CFBundleShortVersionString string 1.0" \
+            -c "Add :LSMinimumSystemVersion string 13.0" -c "Add :LSUIElement bool true" \
+            -c "Add :VSLaunchApp string ${APP_ID[$i]}" "$dir/Contents/Info.plist" >/dev/null
+        iconf=$(bundle_key "${APP_PATH[$i]}" CFBundleIconFile); iconf=${iconf%.icns}
+        icon="${APP_PATH[$i]}/Contents/Resources/$iconf.icns"
+        [ -n "$iconf" ] && [ -f "$icon" ] || icon=-
+        color=1F8A4C; [[ "${APP_ARGS[$i]}" =~ incognito|private ]] && color=5B2A86
+        "$LIBEXEC/makeicon" "$icon" "$dir/Contents/Resources/icon.icns" "$color" >/dev/null 2>&1 || true
+        codesign --force --sign - "$dir" >/dev/null 2>&1 || true
+    done
+    chown -R root:wheel "$APPS_DIR"; chmod -R go-w "$APPS_DIR"
+}
+
+app_add() {   # id nombre ruta [argumentos...]
+    local id="$1" name="$2" path="$3"; shift 3; local args="$*" p
+    valid_app_id "$id" || die "id no válido (minúsculas, números y guiones): $id"
+    valid_app_name "$name" || die "nombre no válido: $name"
+    valid_app_path "$path" || die "ruta no válida (debe ser /Applications/Algo.app o ~/Applications/Algo.app): $path"
+    valid_app_args "$args" || die "argumentos no válidos: $args"
+    [ -n "$(bundle_key "$path" CFBundleExecutable)" ] || die "no encuentro una app en $path"
+    [ "$path" != "$BASE" ] && [[ "$path" != "$APPS_DIR/"* ]] || die "no se puede proteger VPN Selectivo"
+    load_apps; app_index "$id" >/dev/null && die "ya existe una app con id $id"
+    [ -f "$APPS_CONF" ] || printf '# id | Nombre | Ruta de la app | argumentos opcionales\n' > "$APPS_CONF"
+    # Si la app ya está abierta (sin VPN), se deja vivir hasta que se cierre:
+    # entrar al túnel exige reiniciarla (vsctl launch la reabre protegida).
+    APP_PATH+=("$path")
+    for p in $(stray_pids "$path" all); do echo "$p" >> "$GRACE"; done
+    printf '%s | %s | %s | %s | 1\n' "$id" "$name" "$path" "$args" >> "$APPS_CONF"
+    chown root:wheel "$APPS_CONF"; chmod 644 "$APPS_CONF"
+    APPS_MTIME=""; load_apps; app_sync
+    log "app protegida añadida: $id ($path${args:+ $args})"
+    echo "Añadida: $name."
+    [ -s "$GRACE" ] && grep -q . "$GRACE" && [ -n "$(stray_pids "$path" all)" ] &&
+        echo "PENDIENTE: $name está abierta sin VPN; entrará al túnel cuando la reinicies."
+    return 0
+}
+
+app_remove() {
+    local id="$1" tmp
+    load_apps; app_index "$id" >/dev/null || die "no hay ninguna app con id $id"
+    tmp=$(mktemp "$ETC/.apps.XXXXXX")
+    awk -F'|' -v id="$id" '{ x=$1; gsub(/[[:space:]]/, "", x) } x != id' "$APPS_CONF" > "$tmp"   # quitar solo esa línea
+    chown root:wheel "$tmp"; chmod 644 "$tmp"; mv -f "$tmp" "$APPS_CONF"
+    APPS_MTIME=""; load_apps; app_sync
+    log "app protegida quitada: $id"
+    echo "Quitada: $id. Si estaba abierta, sigue en el túnel hasta que la reinicies."
+}
+
+app_auto() {   # id 0|1 → aplica a todas las entradas de la misma app
+    local id="$1" v="$2" i path tmp
+    [[ "$v" =~ ^[01]$ ]] || die "uso: app-auto <id> 0|1"
+    load_apps; i=$(app_index "$id") || die "no hay ninguna app con id $id"; path="${APP_PATH[$i]}"
+    tmp=$(mktemp "$ETC/.apps.XXXXXX")
+    awk -F'|' -v path="$path" -v v="$v" 'BEGIN { OFS = "|" }
+        /^[[:space:]]*#/ || NF < 3 { print; next }
+        { p = $3; gsub(/^[[:space:]]+|[[:space:]]+$/, "", p)
+          if (p == path) { while (NF < 5) $(NF + 1) = " "; if ($4 ~ /^[[:space:]]*$/) $4 = "  "; $5 = " " v } print }' "$APPS_CONF" > "$tmp"
+    chown root:wheel "$tmp"; chmod 644 "$tmp"; mv -f "$tmp" "$APPS_CONF"
+    log "Auto-VPN de $path: $v"
+    echo "Auto-VPN $([ "$v" = 1 ] && echo activado || echo desactivado) para ${APP_NAME[$i]}"
+}
+
+set_auto() {   # on|off
+    case "$1" in on) echo 1 > "$AUTO_FILE" ;; off) echo 0 > "$AUTO_FILE" ;; *) die "uso: set-auto on|off" ;; esac
+    chown root:wheel "$AUTO_FILE"; chmod 644 "$AUTO_FILE"
+    log "Auto-VPN global: $1"; echo "Auto-VPN global: $1"
+}
+
+# IP de salida real (am.i.mullvad.net, vista desde un proceso del grupo). En
+# segundo plano: el daemon no se bloquea. Valores saneados antes del JSON.
+exit_refresh() {
+    local srv; srv=$(cat "$TUN/server" 2>/dev/null)
+    (
+        out=$("$VPNRUN" "$VS_USER" /usr/bin/curl -s --max-time 12 https://am.i.mullvad.net/json 2>/dev/null)
+        clean() { tr -d '"\\\000-\037' | cut -c1-60; }
+        ip=$(echo "$out" | json_field ip | clean); co=$(echo "$out" | json_field country | clean)
+        ci=$(echo "$out" | json_field city | clean); mv_=$(echo "$out" | json_field mullvad_exit_ip | clean)
+        [ -n "$ip" ] || exit 0
+        tmp=$(mktemp "$RUN/.exit.XXXXXX") || exit 0
+        printf 'SERVER=%s\nIP=%s\nCOUNTRY=%s\nCITY=%s\nMULLVAD=%s\n' "$srv" "$ip" "$co" "$ci" "$mv_" > "$tmp"
+        chmod 644 "$tmp"; mv -f "$tmp" "$RUN/exit"
+    ) >/dev/null 2>&1 &
+}
+exit_field() { sed -n "s/^$1=//p" "$RUN/exit" 2>/dev/null | head -n1; }
+
+# ── estado ────────────────────────────────────────────────────────────────────
+OFFICIAL="desconocido"
+write_status() {
+    local tunnel=down mode server="" ifn="" hs_age=-1 rx=0 tx=0 now procs running
+    now=$(date +%s)
+    mode=$(cat "$RUN/mode" 2>/dev/null || echo none)
+    if tunnel_alive; then
+        tunnel=up; ifn=$(cat "$TUN/ifname"); server=$(cat "$TUN/server" 2>/dev/null)
+        local hs; hs=$("$WG" show "$ifn" latest-handshakes 2>/dev/null | awk '{print $2+0; exit}')
+        [ "${hs:-0}" -gt 0 ] && hs_age=$((now - hs))
+        read -r rx tx <<< "$("$WG" show "$ifn" transfer 2>/dev/null | awk '{print $2+0, $3+0; exit}')"
+        [ "$hs_age" -gt 180 ] && tunnel=stale
+    fi
+    procs=$(count_group); running=$(running_apps)
+    local configured=false; identity_label >/dev/null && configured=true
+    local manual=false; [ -f "$RUN/manual-down" ] && manual=true
+    local manual_on=false; [ -f "$RUN/manual-on" ] && manual_on=true
+    local av=0; auto_vpn_on && av=1
+    local eip="" eco="" eci=""
+    if [ "$tunnel" != down ] && [ "$(exit_field SERVER)" = "$server" ]; then
+        eip=$(exit_field IP); eco=$(exit_field COUNTRY); eci=$(exit_field CITY)
+    fi
+    local sel; sel=$(selected_value || true)
+    local tmp; tmp=$(mktemp "$RUN/.status.XXXXXX") || return
+    printf '{"ts":%d,"configured":%s,"tunnel":"%s","mode":"%s","server":"%s","selected":"%s","iface":"%s","handshake_age":%d,"rx":%d,"tx":%d,"protected":%d,"running":"%s","manual_down":%s,"manual_on":%s,"auto_vpn":%d,"exit_ip":"%s","exit_country":"%s","exit_city":"%s","pf":"%s","official_mullvad":"%s","error":"%s","enforce":%d,"gid":%d}\n' \
+        "$now" "$configured" "$tunnel" "$mode" "$server" "$sel" "$ifn" "$hs_age" "${rx:-0}" "${tx:-0}" \
+        "${procs:-0}" "$running" "$manual" "$manual_on" "$av" "$eip" "$eco" "$eci" "$PF_STATE" "$OFFICIAL" "$LAST_ERROR" "$ENFORCE" "$VS_GID" > "$tmp"
+    chmod 644 "$tmp"; mv -f "$tmp" "$STATUS"
+}
+
+lock() {
+    local i=0
+    while ! shlock -p $$ -f "$RUN/.lock" 2>/dev/null; do
+        i=$((i + 1)); [ $i -lt 300 ] || die "otra operación de VPN Selectivo sigue en curso"
+        sleep 0.1
+    done
+    trap 'rm -f "$RUN/.lock"' EXIT
+}
+unlock() { rm -f "$RUN/.lock"; trap - EXIT; }
+
+daemon_alive() {   # el daemon reescribe status.json cada segundo
+    local ts; ts=$(sed -n 's/.*"ts":\([0-9]*\).*/\1/p' "$STATUS" 2>/dev/null)
+    [[ "$ts" =~ ^[0-9]+$ ]] && [ $(( $(date +%s) - ts )) -lt 6 ]
+}
+# Abrir un FIFO sin lector bloquea: solo se escribe si el daemon está vivo.
+kick() { daemon_alive || return 1; { printf '%s\n' "$1" > "$FIFO" & } 2>/dev/null; sleep 0.2; }
+
+wait_status() {   # espera hasta $1 s a que el túnel quede "up"
+    local i=0 t
+    while [ $i -lt $(( $1 * 5 )) ]; do
+        t=$(sed -n 's/.*"tunnel":"\([a-z]*\)".*/\1/p' "$STATUS" 2>/dev/null)
+        [ "$t" = up ] && return 0
+        sleep 0.2; i=$((i + 1))
+    done
+    return 1
+}
+
+wait_selected() {   # $1 = selección  $2 = s → túnel arriba en un servidor que encaja
+    local i=0 t srv
+    while [ $i -lt $(( $2 * 5 )) ]; do
+        t=$(sed -n 's/.*"tunnel":"\([a-z]*\)".*/\1/p' "$STATUS" 2>/dev/null)
+        srv=$(sed -n 's/.*"server":"\([^"]*\)".*/\1/p' "$STATUS" 2>/dev/null)
+        if [ "$t" = up ] && { [ "$srv" = "$1" ] || [ "${srv#"$1"-}" != "$srv" ]; }; then echo "$srv"; return 0; fi
+        sleep 0.2; i=$((i + 1))
+    done
+    return 1
+}
+
+# ── daemon ────────────────────────────────────────────────────────────────────
+PF_STATE=ok
+run_daemon() {
+    ensure_rundir
+    [ -p "$FIFO" ] || { rm -f "$FIFO"; mkfifo -m 600 "$FIFO"; }
+    exec 3<>"$FIFO"
+    touch "$EVENTS"; chmod 644 "$EVENTS"
+    log "daemon iniciado (pid $$)"
+    lock
+    pf_bootstrap_hook || log "ADVERTENCIA: el conjunto principal de PF no evalúa com.apple/*"
+    pf_ensure_enabled || log "ADVERTENCIA: no se pudo habilitar PF"
+    if tunnel_alive; then pf_load route; else tunnel_kill_recorded; pf_load block; fi
+    unlock
+    trap 'log "daemon detenido"; exit 0' TERM INT
+
+    # last_activity=0: el túnel solo se levanta a demanda (apps o "connect").
+    local tick=0 cmd next_retry=0 backoff=5 last_activity=0 frozen=0 now n last_status=0 last_relays_try=0 last_exit_try=0
+    while :; do
+        cmd=""
+        read -t 1 -u 3 cmd || true
+        now=$(date +%s); tick=$((tick + 1))
+        # Lista pública de servidores: al faltar o cada 7 días (reintento cada hora).
+        if [ "$cmd" = relays ] || { [ $((now - last_relays_try)) -ge 3600 ] &&
+             { ! relays_ok || [ $((now - $(stat -f %m "$RELAYS"))) -ge 604800 ]; }; }; then
+            last_relays_try=$now; relays_update >/dev/null
+        fi
+        lock
+        load_apps
+
+        case "$cmd" in
+            up)      rm -f "$RUN/manual-down"; last_activity=$now; next_retry=0; backoff=5 ;;   # Auto-VPN / pruebas
+            on)      rm -f "$RUN/manual-down"; touch "$RUN/manual-on"; next_retry=0; backoff=5 ;; # interruptor ON
+            down)    rm -f "$RUN/manual-on"; touch "$RUN/manual-down"; tunnel_alive && tunnel_down ;;
+            reselect) tunnel_alive && tunnel_down; next_retry=0; backoff=5 ;;
+        esac
+
+        # 1. Apps protegidas abiertas por fuera de la VPN → terminar al instante.
+        if [ "$ENFORCE" = 1 ]; then
+            n=$(kill_strays any)
+            [ "$n" -gt 0 ] && notify_user "Una app protegida se abrió sin VPN y se cerró. Se reabrirá protegida (o usa su ícono VPN)."
+        fi
+
+        # 2. Integridad de PF. Si alguien lo apagó o tocó el anchor, congelar
+        #    (SIGSTOP, sin cerrar nada) los procesos protegidos y reparar.
+        if ! pf_enabled || ! anchor_ok || { [ $((tick % 5)) -eq 0 ] && ! pf_hook_ok; }; then
+            if pgrep -G "$VS_GID" >/dev/null 2>&1; then pkill -STOP -G "$VS_GID"; frozen=1; fi
+            [ "$PF_STATE" = broken ] ||
+                log "INCIDENTE: PF desactivado o anchor alterado; apps protegidas congeladas (SIGSTOP) mientras se repara"
+            pf_ensure_enabled
+            pf_hook_ok || pf_bootstrap_hook
+            if tunnel_alive; then pf_load route; else pf_load block; fi
+            if pf_protected; then
+                PF_STATE=repaired; event pf_repaired
+                [ "$frozen" = 1 ] && { pkill -CONT -G "$VS_GID"; frozen=0; }
+                log "PF reparado; apps reanudadas"
+            elif [ "$PF_STATE" != broken ]; then
+                PF_STATE=broken; event pf_broken
+                log "PF NO se pudo reparar; las apps protegidas siguen congeladas"
+                notify_user "Cortafuegos alterado: las apps protegidas quedan congeladas por seguridad. Revisa el registro."
+            fi
+        elif [ "$frozen" = 1 ]; then
+            pkill -CONT -G "$VS_GID"; frozen=0; PF_STATE=ok; log "PF de nuevo íntegro; apps reanudadas"
+        fi
+
+        # 3. Túnel: arriba mientras haya procesos protegidos (o petición reciente).
+        # Auto-VPN: solo las apps con ⚡ abiertas mantienen el túnel encendido.
+        [ "$(auto_group_count)" -gt 0 ] && last_activity=$now
+        grace_cleanup
+        if [ -f "$TUN/pid" ] && ! tunnel_alive; then
+            log "túnel caído inesperadamente: se bloquea el tráfico protegido"
+            event tunnel_lost
+            tunnel_down
+        fi
+        if ! tunnel_alive && [ ! -f "$RUN/manual-down" ] &&
+           { [ -f "$RUN/manual-on" ] || [ $((now - last_activity)) -lt "$IDLE_DOWN_SECONDS" ]; } &&
+           [ "$now" -ge "$next_retry" ] && selected_server >/dev/null; then
+            if tunnel_up; then backoff=5; event tunnel_up; exit_refresh
+            else
+                next_retry=$((now + backoff)); [ $backoff -lt 60 ] && backoff=$((backoff * 2))
+                pf_load block
+            fi
+        fi
+        if tunnel_alive && [ ! -f "$RUN/manual-on" ] && [ $((now - last_activity)) -ge "$IDLE_DOWN_SECONDS" ]; then
+            log "sin apps con Auto-VPN durante ${IDLE_DOWN_SECONDS}s: desconectando"
+            tunnel_down
+        fi
+        # Coherencia: modo route solo con túnel vivo; reglas LAN al cambiar de red.
+        if [ "$(cat "$RUN/mode" 2>/dev/null)" = route ] && ! tunnel_alive; then pf_load block; fi
+        if [ "$ALLOW_LAN" = 1 ] && [ $((tick % 5)) -eq 0 ] && [ "$(lan_signature)" != "${LAN_SIG:-}" ]; then
+            if tunnel_alive; then pf_load route; else pf_load block; fi
+        fi
+
+        if tunnel_alive && { [ "$(exit_field SERVER)" != "$(cat "$TUN/server" 2>/dev/null)" ] ||
+             [ $((now - $(stat -f %m "$RUN/exit" 2>/dev/null || echo 0))) -ge 600 ]; } &&
+           [ $((now - ${last_exit_try:-0})) -ge 30 ]; then
+            last_exit_try=$now; exit_refresh
+        fi
+
+        # 4. Cliente oficial de Mullvad (solo informativo).
+        if [ $((tick % 5)) -eq 1 ] && [ -x "$MULLVAD" ]; then
+            OFFICIAL=$("$MULLVAD" status 2>/dev/null | head -n1 | awk '{print $1}' | tr -cd 'A-Za-z')
+            [ -n "$OFFICIAL" ] || OFFICIAL="desconocido"
+        fi
+
+        if [ -n "$cmd" ] || [ $((now - last_status)) -ge 1 ]; then write_status; last_status=$now; fi
+        [ "$(stat -f %z "$LOG" 2>/dev/null || echo 0)" -gt 5000000 ] && mv -f "$LOG" "$LOG.1"
+        [ "$(stat -f %z "$EVENTS" 2>/dev/null || echo 0)" -gt 200000 ] && : > "$EVENTS"
+        unlock
+    done
+}
+
+# ── importación de configuraciones de Mullvad ────────────────────────────────
+# Lee el archivo con los permisos del usuario (no de root), extrae solo los
+# campos necesarios, los valida y los guarda normalizados (root, 600).
+parse_conf_into() {   # $1 archivo .conf  $2 etiqueta
+    local f="$1" label="$2" line k v sect="" pk="" addr="" ppk="" ep="" a
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}; line=${line%%#*}
+        [[ "$line" =~ ^[[:space:]]*\[([A-Za-z]+)\][[:space:]]*$ ]] && { sect=$(echo "${BASH_REMATCH[1]}" | tr A-Z a-z); continue; }
+        [[ "$line" =~ ^[[:space:]]*([A-Za-z]+)[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$ ]] || continue
+        k=$(echo "${BASH_REMATCH[1]}" | tr A-Z a-z); v="${BASH_REMATCH[2]}"
+        case "$sect:$k" in
+            interface:privatekey) pk="$v" ;;
+            interface:address) for a in $(echo "$v" | tr ',' ' '); do
+                                   # valid_ipv4 reescribe BASH_REMATCH: guardar antes
+                                   [[ "$a" =~ ^([0-9.]+)/32$ ]] || continue
+                                   a="${BASH_REMATCH[1]}"
+                                   valid_ipv4 "$a" && addr="$a"
+                               done ;;
+            peer:publickey) ppk="$v" ;;
+            peer:endpoint) ep="$v" ;;
+        esac
+    done < "$f"
+    valid_key "$pk" || { echo "  $label: clave privada ausente o inválida" >&2; return 1; }
+    valid_key "$ppk" || { echo "  $label: clave pública del servidor inválida" >&2; return 1; }
+    valid_ipv4 "$addr" || { echo "  $label: falta la dirección IPv4 /32 del túnel" >&2; return 1; }
+    [[ "$ep" =~ ^([0-9.]+):([0-9]{1,5})$ ]] && valid_ipv4 "${BASH_REMATCH[1]}" ||
+        { echo "  $label: Endpoint debe ser IPv4:puerto (genera la configuración con IPv4)" >&2; return 1; }
+    (umask 077; printf 'PRIVATE_KEY=%s\nADDRESS4=%s\nPEER_PUBLIC_KEY=%s\nENDPOINT=%s\n' "$pk" "$addr" "$ppk" "$ep" \
+        > "$SERVERS/$label.conf")
+    chown root:wheel "$SERVERS/$label.conf"; chmod 600 "$SERVERS/$label.conf"
+}
+
+do_import() {
+    local src="$1" work n=0 f label
+    [[ "$src" = /* ]] && [[ "$src" != *$'\n'* ]] || die "ruta no válida"
+    work=$(mktemp -d /var/run/vpnselectivo-import.XXXXXX) || die "no se pudo crear carpeta temporal"
+    chmod 700 "$work"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$work'" EXIT
+    sudo -u "$VS_USER" /bin/test -r "$src" || die "no puedo leer $src con tus permisos"
+    sudo -u "$VS_USER" /bin/cat -- "$src" | head -c 52428800 > "$work/in" || die "lectura fallida"
+    mkdir -p "$work/x" && chmod 700 "$work/x"
+    if [ "$(head -c 2 "$work/in")" = "PK" ]; then
+        unzip -qq -j -o "$work/in" '*.conf' -d "$work/x" 2>/dev/null || die "el zip no contiene archivos .conf"
+    else
+        label=$(basename "$src"); label=${label%.conf}
+        cp "$work/in" "$work/x/$label.conf"
+    fi
+    mkdir -p "$SERVERS"; chown root:wheel "$SERVERS"; chmod 700 "$SERVERS"
+    for f in "$work"/x/*.conf; do
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
+        label=$(basename "$f" .conf); label=${label#mullvad-}
+        label=$(printf '%s' "$label" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-64)
+        valid_label "$label" || continue
+        parse_conf_into "$f" "$label" && n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] || die "ninguna configuración WireGuard válida"
+    if ! valid_label "$(cat "$ETC/selected" 2>/dev/null)" || [ ! -f "$SERVERS/$(cat "$ETC/selected").conf" ]; then
+        f=$(ls "$SERVERS" | sed -n 's/\.conf$//p' | head -n1)
+        echo "$f" > "$ETC/selected"; chmod 644 "$ETC/selected"
+    fi
+    log "importadas $n configuraciones; seleccionada $(cat "$ETC/selected")"
+    echo "Importadas $n configuraciones. Servidor seleccionado: $(cat "$ETC/selected")"
+}
+
+# ── lanzamiento de apps protegidas ───────────────────────────────────────────
+launch_app() {
+    local id="$1" restore="${2:-}" i bin path args=()
+    load_apps
+    i=$(app_index "$id") || die "app desconocida: $id (disponibles: ${APP_ID[*]:-ninguna; agrega una desde el menú})"
+    bin="${APP_EXE[$i]}"; path="${APP_PATH[$i]}"
+    [ -x "$bin" ] || die "no encuentro $bin"
+    daemon_alive || die "el servicio de VPN Selectivo no está activo (revisa /Library/Logs/VPNSelectivo.log)"
+    selected_server >/dev/null || die "falta importar la configuración WireGuard de Mullvad (menú › Importar configuración)"
+
+    # Matar instancias abiertas por fuera de la VPN (sin grupo), también las que
+    # estaban en gracia: abrirla protegida es justo el reinicio pendiente.
+    local p; for p in $(stray_pids "$path" all); do kill -KILL "$p" 2>/dev/null; done
+    local w=0; while [ -n "$(stray_pids "$path" all)" ] && [ $w -lt 30 ]; do sleep 0.1; w=$((w + 1)); done
+    is_chromium "$path" && sleep 0.4   # el singleton de Chromium libera su socket
+
+    if [ -f "$RUN/manual-on" ] || { auto_vpn_on && [ "${APP_AUTO[$i]}" = 1 ]; }; then
+        kick up
+        wait_status 20 || echo "AVISO: el túnel aún no está arriba; la app quedará SIN conexión hasta que lo esté" >&2
+    elif ! tunnel_alive; then
+        if auto_vpn_on; then
+            echo "AVISO: la VPN está apagada y ${APP_NAME[$i]} no tiene Auto-VPN (⚡): quedará SIN conexión hasta que enciendas la VPN" >&2
+        else
+            echo "AVISO: la VPN está apagada y Auto-VPN está desactivado: ${APP_NAME[$i]} quedará SIN conexión hasta que enciendas la VPN" >&2
+        fi
+    fi
+
+    # Invariante de seguridad: no lanzar nada sin PF y el anchor verificados.
+    lock
+    pf_protected || { unlock; die "PF no está protegiendo; no se lanza la app"; }
+    unlock
+
+    # shellcheck disable=SC2206  # argumentos ya validados (sin espacios internos)
+    [ -n "${APP_ARGS[$i]}" ] && args=(${APP_ARGS[$i]})
+    if group_main_running "$bin"; then
+        # Ya abierta dentro de la VPN. Chromium/Electron con argumentos (p. ej.
+        # --incognito): su singleton los recibe y abre la ventana. Si no, solo
+        # traerla al frente (open -b no lanza otra instancia de una app en marcha).
+        if [ ${#args[@]} -eq 0 ] || ! is_chromium "$path"; then
+            sudo -u "$VS_USER" open -b "${APP_BID[$i]}"; echo OK; return 0
+        fi
+    elif [ "$restore" = --restore ] && is_chromium "$path" && [ ${#args[@]} -eq 0 ]; then
+        args=(--restore-last-session)
+    fi
+    # SIGHUP ignorado hasta que vpnrun cree su propia sesión (lo restablece
+    # antes del exec): así el cierre del pty de sudo no puede matar la app.
+    ( trap '' HUP; exec env -i LANG="${LANG:-es_ES.UTF-8}" "$VPNRUN" "$VS_USER" "$bin" ${args[@]+"${args[@]}"} ) &
+    disown 2>/dev/null || true
+    sleep 0.3
+    log "lanzada $id dentro de la VPN${args[*]:+ (${args[*]})}"
+    echo "OK"
+}
+
+# ── diagnóstico y pruebas ─────────────────────────────────────────────────────
+group_curl() { "$VPNRUN" "$VS_USER" /usr/bin/curl -s --max-time "${2:-10}" ${3:-} "$1"; }
+user_curl()  { sudo -u "$VS_USER" /usr/bin/curl -s --max-time "${2:-10}" ${3:-} "$1"; }
+json_field() { sed -n "s/.*\"$1\": *\"\{0,1\}\([^\",}]*\).*/\1/p" | head -n1; }
+
+check_ip() {
+    local v d
+    v=$(group_curl https://am.i.mullvad.net/json 12)
+    d=$(user_curl https://am.i.mullvad.net/json 12)
+    printf 'VPN (apps protegidas): ip=%s pais=%s mullvad=%s servidor=%s\n' \
+        "$(echo "$v" | json_field ip)" "$(echo "$v" | json_field country)" \
+        "$(echo "$v" | json_field mullvad_exit_ip)" "$(echo "$v" | json_field mullvad_exit_ip_hostname)"
+    printf 'Directo (Chrome y resto): ip=%s pais=%s mullvad=%s\n' \
+        "$(echo "$d" | json_field ip)" "$(echo "$d" | json_field country)" "$(echo "$d" | json_field mullvad_exit_ip)"
+}
+
+diag() {
+    echo "== estado"; cat "$STATUS" 2>/dev/null
+    echo "== PF"; pfctl -s info 2>/dev/null | head -n1
+    pf_hook_ok && echo "gancho com.apple/* presente" || echo "GANCHO com.apple/* AUSENTE"
+    echo "== anchor $ANCHOR (contadores por regla)"; pfctl -a "$ANCHOR" -v -s rules 2>/dev/null
+    anchor_ok && echo "(coincide con lo esperado)" || echo "(NO coincide con lo esperado)"
+    if tunnel_alive; then echo "== túnel"; "$WG" show "$(cat "$TUN/ifname")"; fi
+    echo "== procesos con el grupo $GROUP_NAME ($VS_GID)"
+    proc_table | awk -v g="$VS_GID" '$3 == g' | cut -c1-160
+    echo "== apps protegidas (apps.conf)"; load_apps
+    for i in "${!APP_ID[@]}"; do echo "  ${APP_ID[$i]} | ${APP_NAME[$i]} | ${APP_PATH[$i]} | ${APP_ARGS[$i]}"; done
+    echo "== procesos de apps protegidas FUERA del grupo"; stray_pids any | tr '\n' ' '; echo
+}
+
+selftest() {
+    local fail=0 v d vip dip out t0 t1
+    pass() { echo "OK    $*"; }
+    bad()  { echo "FALLO $*"; fail=1; }
+    pf_enabled && pass "PF activo" || bad "PF inactivo"
+    pf_hook_ok && pass "gancho com.apple/* presente en PF" || bad "gancho PF ausente"
+    anchor_ok && pass "anchor intacto" || bad "anchor alterado"
+    kick up; wait_status 20 && pass "túnel arriba ($(cat "$TUN/server" 2>/dev/null))" || bad "túnel no se levantó (${LAST_ERROR:-ver registro})"
+    v=$(group_curl https://am.i.mullvad.net/json 12); vip=$(echo "$v" | json_field ip)
+    d=$(user_curl https://am.i.mullvad.net/json 12); dip=$(echo "$d" | json_field ip)
+    [ "$(echo "$v" | json_field mullvad_exit_ip)" = true ] && pass "proceso protegido sale por Mullvad ($(echo "$v" | json_field mullvad_exit_ip_hostname))" ||
+        bad "proceso protegido NO sale por Mullvad"
+    if [ "$(echo "$d" | json_field mullvad_exit_ip)" = false ]; then pass "proceso normal sale SIN VPN (como Chrome)"
+    elif [ "$OFFICIAL" = Connected ] || "$MULLVAD" status 2>/dev/null | grep -q '^Connected'; then
+        echo "AVISO el cliente oficial de Mullvad está conectado: el tráfico normal también va por VPN"
+    else bad "proceso normal sale por VPN o sin respuesta"; fi
+    [ -n "$vip" ] && [ "$vip" != "$dip" ] && pass "IP protegida distinta de la directa" || bad "IPs iguales o vacías"
+    # IPv6: ipv6.am.i.mullvad.net solo tiene AAAA. Si tu red no tiene IPv6,
+    # la prueba no puede demostrar nada (la regla de bloqueo sigue cargada).
+    out=$(group_curl https://ipv6.am.i.mullvad.net/json 6 -6)
+    if [ -n "$out" ]; then bad "IPv6 FILTRA: $(echo "$out" | json_field ip)"
+    elif [ -n "$(user_curl https://ipv6.am.i.mullvad.net/json 6 -6)" ]; then pass "IPv6 bloqueado para procesos protegidos (tu red sí tiene IPv6)"
+    else echo "N/A   tu red no tiene IPv6 global: no hay por dónde filtrar; la regla de bloqueo IPv6 está cargada"; fi
+    # UDP: OpenDNS por el puerto 443 devuelve la IP de origen (el 53 suelen
+    # interceptarlo los routers/ISP).
+    out=$("$VPNRUN" "$VS_USER" /usr/bin/dig +short +time=3 +tries=2 -p 443 @208.67.222.222 myip.opendns.com 2>/dev/null | tail -n1)
+    [ -n "$out" ] && [ "$out" = "$vip" ] && pass "UDP sale por el túnel (OpenDNS vio $out)" || bad "UDP: OpenDNS vio '$out' (esperado $vip)"
+    # Kill switch: matar wireguard-go de golpe (como un fallo) y comprobar que
+    # durante la caída no hay salida directa; después, la reconexión.
+    if tunnel_alive; then
+        kill -KILL "$(cat "$TUN/pid")"; t0=$(date +%s)
+        out=$(group_curl https://am.i.mullvad.net/json 4)
+        if [ -z "$out" ]; then pass "túnel caído → proceso protegido sin conexión (sin fuga)"
+        elif [ "$(echo "$out" | json_field mullvad_exit_ip)" = true ]; then pass "túnel caído → reconectó antes de responder; salida por Mullvad (sin fuga)"
+        else bad "FUGA: con el túnel caído salió por $(echo "$out" | json_field ip)"; fi
+        sleep 2
+        wait_status 30 && { t1=$(date +%s); pass "reconexión automática en $((t1 - t0)) s"; } || bad "no se reconectó"
+        v=$(group_curl https://am.i.mullvad.net/json 12)
+        [ "$(echo "$v" | json_field mullvad_exit_ip)" = true ] && pass "tras reconectar, de nuevo por Mullvad" || bad "tras reconectar no sale por Mullvad"
+    fi
+    [ $fail = 0 ] && echo "RESULTADO: todas las pruebas automáticas superadas" || echo "RESULTADO: HAY FALLOS"
+    return $fail
+}
+
+# Captura en las interfaces FÍSICAS (PKTAP) cualquier paquete atribuido a un
+# proceso protegido, ya sea enviado por él (pid) o por un servicio del sistema
+# en su nombre (epid: nsurlsessiond, WebKit, mDNSResponder...). El tráfico que
+# va por el túnel no aparece aquí: solo se ve el UDP cifrado de wireguard-go.
+#
+# Además captura por NOMBRE de proceso (apps de apps.conf) para ver si una
+# instancia abierta por fuera de la VPN llegó a enviar algo antes de ser
+# terminada. Las líneas se clasifican al final:
+#   protegido-DNS   mDNSResponder resolviendo en nombre de un proceso protegido
+#   protegido-LAN   multicast/enlace local (no sale de tu red)
+#   protegido-OTRO  ¡fuga real hacia fuera del túnel!
+#   por-fuera       instancia sin grupo (antes de que la terminaran)
+leakwatch() {
+    local secs="${1:-60}" pids expr="" p ifs out tp
+    [[ "$secs" =~ ^[0-9]{1,3}$ ]] && [ "$secs" -ge 5 ] && [ "$secs" -le 600 ] || die "segundos: 5..600"
+    pids=$(proc_table | awk -v g="$VS_GID" '$3 == g {print $1}')
+    for p in $pids; do expr="$expr or pid=$p or epid=$p"; done
+    ifs=$(physical_ifs | sed 's/ *$//; s/ /,/g')
+    [ -n "$ifs" ] || die "sin interfaces físicas"
+    out=$(mktemp "$RUN/.leak.XXXXXX")
+    load_apps
+    # Nombres tal como los registra el kernel (16 caracteres): el ejecutable
+    # principal y "<ejecutable> Helper" (Chromium/Electron).
+    local names="" nm e
+    for e in ${APP_EXE[@]+"${APP_EXE[@]}"}; do
+        for nm in "$(basename "$e" | cut -c1-16)" "$(printf '%s Helper' "$(basename "$e")" | cut -c1-16)"; do
+            [[ "$nm" =~ ^[A-Za-z0-9\ ._-]+$ ]] || continue
+            [[ "$names" == *"proc = '$nm'"* ]] && continue
+            names="$names${names:+ or }proc = '$nm' or eproc = '$nm'"
+        done
+    done
+    [ -n "$names" ] || names="proc = 'ninguna-app-configurada'"
+    echo "Vigilando $secs s las interfaces $ifs ($(echo "$pids" | grep -c .) procesos protegidos, más cualquier app protegida sin grupo)…"
+    # Dos capturas: el analizador de -Q de Apple rechaza mezclar nombres entre
+    # comillas con varios pid=… en una misma expresión.
+    local tp2="" err; err=$(mktemp "$RUN/.leakerr.XXXXXX")
+    tcpdump -i "pktap,$ifs" -k -n -q -l \
+        -Q "$names" \
+        > "$out.n" 2>>"$err" &
+    tp=$!
+    if [ -n "$expr" ]; then
+        tcpdump -i "pktap,$ifs" -k -n -q -l -Q "( ${expr# or } )" > "$out.p" 2>>"$err" &
+        tp2=$!
+    fi
+    sleep 1
+    if ! kill -0 "$tp" 2>/dev/null || { [ -n "$tp2" ] && ! kill -0 "$tp2" 2>/dev/null; }; then
+        kill "$tp" $tp2 2>/dev/null
+        echo "ERROR: tcpdump no pudo iniciar la captura:"; grep -v '^listening\|^tcpdump: verbose' "$err" | head -n 5
+        rm -f "$out" "$out.n" "$out.p" "$err"; return 1
+    fi
+    sleep $((secs - 1)); kill "$tp" $tp2 2>/dev/null; wait "$tp" $tp2 2>/dev/null
+    # Un paquete que encaja en ambas capturas aparece dos veces con marcas que
+    # difieren en microsegundos: deduplicar por milisegundo + contenido.
+    cat "$out.n" "$out.p" 2>/dev/null | sort | awk '!seen[substr($0, 1, 12) substr($0, 16)]++' > "$out"
+    rm -f "$out.n" "$out.p" "$err"
+    # pid y epid de cada línea → clasificar contra los procesos del grupo.
+    local gp; gp=" $(proc_table | awk -v g="$VS_GID" '$3 == g {printf "%s ", $1}')$(echo $pids) "
+    awk -v gp="$gp" '
+        /^[0-9][0-9]:/ {
+            pid = ""; epid = ""
+            if (match($0, /, proc [^,]*:[0-9]+/)) { s = substr($0, RSTART, RLENGTH); sub(/.*:/, "", s); pid = s }
+            if (match($0, /, eproc [^,]*:[0-9]+/)) { s = substr($0, RSTART, RLENGTH); sub(/.*:/, "", s); epid = s }
+            prot = (index(gp, " " pid " ") || (epid != "" && index(gp, " " epid " ")))
+            if (!prot) c = "por-fuera"
+            else if ($0 ~ /proc mDNSResponder/ && $0 ~ /\.53[: ]/) c = "protegido-DNS"
+            else if ($0 ~ /224\.0\.0\.|ff02::|169\.254\.|fe80::/) c = "protegido-LAN"
+            else c = "protegido-OTRO"
+            n[c]++; if (shown[c]++ < 12) lines[c] = lines[c] "    " substr($0, 1, 200) "\n"
+        }
+        END {
+            total = n["protegido-DNS"] + n["protegido-LAN"] + n["protegido-OTRO"] + n["por-fuera"]
+            printf "RESULTADO: %d paquetes en interfaces físicas\n", total
+            printf "  FUGA hacia Internet de procesos protegidos (protegido-OTRO): %d\n", n["protegido-OTRO"]
+            printf "  DNS vía mDNSResponder en su nombre (nombres, no tráfico):    %d\n", n["protegido-DNS"]
+            printf "  multicast/enlace local (no sale de tu red):                   %d\n", n["protegido-LAN"]
+            printf "  instancias por fuera antes de ser terminadas:                 %d\n", n["por-fuera"]
+            split("protegido-OTRO por-fuera protegido-LAN protegido-DNS", order, " ")
+            for (i = 1; i <= 4; i++) if (n[order[i]]) printf "  -- %s\n%s", order[i], lines[order[i]]
+        }' "$out"
+    rm -f "$out"
+}
+
+usage() {
+    cat <<'EOF'
+uso: sudo vsctl <orden>
+  launch <id> [--restore]          abre una app de apps.conf dentro de la VPN
+  apps                             lista las apps protegidas
+  app-add <id> <Nombre> </Applications/App.app> [args]
+  app-remove <id> | app-auto <id> 0|1 | set-auto on|off
+  connect | disconnect                              conectar / desconectar (las apps quedan sin Internet)
+  status | diag | check-ip | selftest | leakwatch [segundos]
+  select <país|ciudad|servidor> (us, us-nyc, us-nyc-wg-301) | relays update
+  servers | import <archivo.conf|.zip>
+EOF
+}
+
+# Desinstalación: deja PF y el sistema como antes de instalar.
+uninstall_teardown() {
+    tunnel_kill_recorded
+    pfctl -a "$ANCHOR" -F all >/dev/null 2>&1
+    local tok; tok=$(cat "$RUN/pf-token" 2>/dev/null)
+    [[ "$tok" =~ ^[0-9]+$ ]] && pfctl -X "$tok" >/dev/null 2>&1
+    rm -rf "$RUN"
+    log "desinstalación: túnel detenido, anchor vaciado, referencia de PF liberada"
+}
+
+case "${1:-}" in
+    _daemon)
+        [ "$CALLER" = root ] || die "uso interno"
+        run_daemon ;;
+    launch)
+        [ $# -ge 2 ] && [ $# -le 3 ] || die "uso: launch <id> [--restore]"
+        [ -z "${3:-}" ] || [ "$3" = --restore ] || die "opción no válida"
+        launch_app "${2:-}" "${3:-}" ;;
+    connect)    kick on || die "servicio inactivo"; wait_status 20 && echo "Conectado" || { echo "No se pudo conectar (ver registro)"; exit 1; } ;;
+    disconnect) kick down || die "servicio inactivo"; echo "Desconectado: las apps protegidas quedan abiertas pero SIN Internet hasta reconectar." ;;
+    status)     cat "$STATUS" 2>/dev/null || echo '{}' ;;
+    servers)    s=$(selected_server); ls "$SERVERS" 2>/dev/null | sed -n 's/\.conf$//p' |
+                    while read -r l; do [ "$l" = "$s" ] && echo "* $l" || echo "  $l"; done ;;
+    select)     [ $# -eq 2 ] && valid_label "$2" || die "uso: select <país|ciudad|servidor>  (p. ej. us, us-nyc, us-nyc-wg-301)"
+                if [ -f "$SERVERS/$2.conf" ]; then :
+                elif relays_ok && { valid_location "$2" || [[ "$2" =~ -wg- ]]; } &&
+                     [ -n "$(candidates "$2")" ]; then :
+                else die "ubicación o servidor desconocido o sin servidores activos: $2"; fi
+                echo "$2" > "$ETC/selected"; chmod 644 "$ETC/selected"; log "ubicación elegida: $2"
+                if tunnel_alive || [ "$(count_group)" -gt 0 ]; then
+                    kick reselect
+                    srv=$(wait_selected "$2" 30) && echo "Conectado a $srv" ||
+                        { echo "Elegido $2, pero aún no conecta (ver registro)"; exit 1; }
+                else
+                    echo "Elegido $2: se usará al abrir una app protegida"
+                fi ;;
+    apps)       load_apps; for i in "${!APP_ID[@]}"; do
+                    printf '%s | %s | %s | %s | %s\n' "${APP_ID[$i]}" "${APP_NAME[$i]}" "${APP_PATH[$i]}" "${APP_ARGS[$i]}" "${APP_AUTO[$i]}"; done ;;
+    app-auto)   [ $# -eq 3 ] || die "uso: app-auto <id> 0|1"; app_auto "$2" "$3" ;;
+    set-auto)   [ $# -eq 2 ] || die "uso: set-auto on|off"; set_auto "$2" ;;
+    refresh-ip) exit_refresh; echo "Comprobando IP de salida…" ;;
+    # app-add/app-remove/app-auto/set-auto: sin contraseña (como la lista de
+    # exclusiones del cliente oficial de Mullvad). Solo admiten apps de
+    # /Applications o ~/Applications y nunca dan privilegios a la app: vpnrun
+    # la ejecuta como el usuario.
+    app-add)    [ $# -ge 4 ] || die "uso: app-add <id> <Nombre> </Applications/App.app> [argumentos]"
+                shift; app_add "$@"; kick reload || true ;;
+    app-remove) [ $# -eq 2 ] || die "uso: app-remove <id>"; app_remove "$2" ;;
+    app-sync)   [ "$CALLER" = root ] || die "uso interno"; load_apps; app_sync "${2:-}"; echo "Lanzadores regenerados" ;;
+    relays)     [ "${2:-}" = update ] || die "uso: relays update"
+                n=$(relays_update) && echo "Lista de servidores actualizada: $n servidores" || die "no se pudo actualizar la lista" ;;
+    import)     [ $# -eq 2 ] || die "uso: import <archivo>"; do_import "$2"; kick reselect || true ;;
+    check-ip)   check_ip ;;
+    diag)       diag ;;
+    selftest)   selftest ;;
+    leakwatch)  leakwatch "${2:-60}" ;;
+    _uninstall) [ "$CALLER" = root ] || die "uso interno"; uninstall_teardown ;;
+    *)          usage; exit 64 ;;
+esac

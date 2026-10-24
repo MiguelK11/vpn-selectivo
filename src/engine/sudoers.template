@@ -1,0 +1,24 @@
+# VPN Selectivo — permite a __USER__ ejecutar, sin contraseña, SOLO estas órdenes
+# del controlador root (que valida cada argumento): abrir apps protegidas,
+# encender/apagar, ubicación, elegir apps y Auto-VPN, diagnóstico. Importar la
+# configuración de Mullvad (clave privada) sigue exigiendo contraseña.
+Cmnd_Alias VPNSELECTIVO = /Library/VPNSelectivo/bin/vsctl launch *, \
+                          /Library/VPNSelectivo/bin/vsctl connect, \
+                          /Library/VPNSelectivo/bin/vsctl disconnect, \
+                          /Library/VPNSelectivo/bin/vsctl status, \
+                          /Library/VPNSelectivo/bin/vsctl servers, \
+                          /Library/VPNSelectivo/bin/vsctl select *, \
+                          /Library/VPNSelectivo/bin/vsctl relays update, \
+                          /Library/VPNSelectivo/bin/vsctl apps, \
+                          /Library/VPNSelectivo/bin/vsctl app-add *, \
+                          /Library/VPNSelectivo/bin/vsctl app-remove *, \
+                          /Library/VPNSelectivo/bin/vsctl app-auto *, \
+                          /Library/VPNSelectivo/bin/vsctl set-auto *, \
+                          /Library/VPNSelectivo/bin/vsctl refresh-ip, \
+                          /Library/VPNSelectivo/bin/vsctl check-ip, \
+                          /Library/VPNSelectivo/bin/vsctl diag, \
+                          /Library/VPNSelectivo/bin/vsctl selftest, \
+                          /Library/VPNSelectivo/bin/vsctl leakwatch, \
+                          /Library/VPNSelectivo/bin/vsctl leakwatch *
+Defaults!VPNSELECTIVO !use_pty
+__USER__ ALL=(root) NOPASSWD: VPNSELECTIVO

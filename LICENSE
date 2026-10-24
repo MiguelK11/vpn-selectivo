@@ -1,0 +1,32 @@
+MIT License
+
+Copyright (c) 2026 MiguelK11 (VPN Selectivo)
+
+Portions derived from VPNonly's privileged engine (src/engine/vpnrun.c and
+third_party/wireguard-go-nat.patch):
+Copyright (c) 2026 Kanishk Razdan — MIT License, see
+third_party/licenses/VPNonly-engine-MIT.txt
+https://github.com/kanishkdan/vpnonly (commit 50d362783a7fd9dd1b78698c18f196018ffa8c23)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Third-party components built from upstream source by src/build.sh keep their
+own licences: wireguard-go (MIT, WireGuard LLC) and wireguard-tools `wg`
+(GPL-2.0-only, Jason A. Donenfeld). Texts in third_party/licenses/.
+"WireGuard" is a registered trademark of Jason A. Donenfeld.

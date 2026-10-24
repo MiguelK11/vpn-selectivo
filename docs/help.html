@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VPN Selectivo — Help</title>
+<style>
+:root { --bg:#fbfbfa; --fg:#1d1d1f; --muted:#5f6368; --card:#ffffff; --line:#e3e3e0; --accent:#1f8a4c; --warn:#a15c00; }
+@media (prefers-color-scheme: dark) { :root { --bg:#161617; --fg:#ececec; --muted:#a1a1a6; --card:#1f1f21; --line:#333336; --accent:#4cc27e; --warn:#f0a64a; } }
+body { background:var(--bg); color:var(--fg); font:15px/1.55 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; margin:0; padding:32px 16px; }
+main { max-width:760px; margin:0 auto; }
+h1 { font-size:26px; margin:0 0 4px; } h2 { font-size:18px; margin:28px 0 8px; }
+p.lead { color:var(--muted); margin-top:0; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 18px; margin:12px 0; }
+table { border-collapse:collapse; width:100%; } td { border-top:1px solid var(--line); padding:7px 6px; vertical-align:top; }
+td:first-child { white-space:nowrap; font-weight:600; }
+code { font:13px ui-monospace, SFMono-Regular, Menlo, monospace; background:color-mix(in srgb, var(--line) 55%, transparent); padding:1px 5px; border-radius:5px; }
+.ok { color:var(--accent); font-weight:600; } .warn { color:var(--warn); font-weight:600; }
+li { margin:4px 0; }
+</style>
+</head>
+<body><main>
+<h1>VPN Selectivo</h1>
+<p class="lead">The apps you choose go through Mullvad; the rest of your Mac uses your normal connection. If the VPN fails, protected apps lose Internet access: they never go out without the VPN.</p>
+
+<h2>Daily use</h2>
+<div class="card"><ul>
+<li>Open <b>VPN Selectivo</b> from the Dock: VPN switch, live status (server and exit IP), location (<i>Ubicación</i>), <b>Auto-VPN</b> and the list of apps to check (through Mullvad) or uncheck (normal connection). No password needed.</li>
+<li><b>Auto-VPN</b> (⚡): opening an app with ⚡ turns the VPN on; it turns off 2 minutes after they are all closed. Checked apps without ⚡ only have Internet access while the VPN is on.</li>
+<li>You can also open apps with their <b>"‹App› VPN"</b> launchers (folder <code>/Applications/VPN Selectivo</code>; drag them to the Dock) or from the menu-bar shield.</li>
+<li>If you open a protected app with its original icon, it is closed instantly and reopened protected (Chromium browsers restore their tabs).</li>
+<li>Apps that are not protected are never touched.</li>
+</ul></div>
+
+<h2>The menu-bar shield</h2>
+<div class="card"><table>
+<tr><td>Shield with lock</td><td><span class="ok">Protected.</span> Protected apps go through Mullvad.</td></tr>
+<tr><td>Half shield</td><td>The server is not responding: protected traffic is stopped (it does not go out without the VPN).</td></tr>
+<tr><td>Shield with ✕</td><td><span class="warn">Protected apps are open but have NO Internet access</span> (connecting, or you switched the VPN off).</td></tr>
+<tr><td>Empty shield</td><td>Idle. It connects when you open an app with ⚡ or turn the switch on.</td></tr>
+<tr><td>Shield with !</td><td>The Mullvad configuration is missing, or the firewall was altered (protected apps are frozen until it is repaired).</td></tr>
+<tr><td>Triangle</td><td>The service is not responding. Check the log or reinstall.</td></tr>
+</table></div>
+
+<h2>Buttons (the interface is in Spanish)</h2>
+<div class="card"><ul>
+<li><b>Comprobar IP</b> (check IP): compares the exit IP of protected apps (Mullvad) with your direct IP.</li>
+<li><b>Autodiagnóstico</b> (self-test): PF, tunnel, IPs, IPv6, UDP and a deliberate tunnel drop (about 30 s).</li>
+<li><b>Vigilar fugas</b> (watch for leaks): with protected apps open, looks for their packets (or packets sent by system services on their behalf) outside the tunnel.</li>
+<li><b>Importar configuración</b> (import configuration): a <code>.conf</code> or <code>.zip</code> from mullvad.net › WireGuard configuration (asks for the administrator password).</li>
+<li><b>Registro</b> (log): opens <code>/Library/Logs/VPNSelectivo.log</code>.</li>
+<li>When you check or uncheck an app that is running: <b>Reiniciar ahora</b> (restart now: quits cleanly and reopens it in/out of the tunnel) or <b>Al cerrarla</b> (when I close it).</li>
+</ul></div>
+
+<h2>Important</h2>
+<div class="card"><ul>
+<li>Don't use the official Mullvad app at the same time: while it is connected, your whole Mac goes through the VPN. Disconnect it; no need to uninstall it.</li>
+<li>What cannot go through the tunnel: work done by system services on behalf of an app (embedded web pages using WebKit, background downloads) and the <i>hostnames</i> looked up through the system DNS.</li>
+<li>Casting to a TV (Chromecast/AirPlay) from a protected app does not work while the local network is blocked (<code>ALLOW_LAN=0</code>).</li>
+<li>Log: <code>/Library/Logs/VPNSelectivo.log</code>. Uninstall: <code>Uninstall.command</code> in the downloaded folder.</li>
+</ul></div>
+</main></body>
+</html>
