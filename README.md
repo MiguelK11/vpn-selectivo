@@ -6,19 +6,15 @@
 
 The official Mullvad app for Mac does the opposite: it puts your **whole** Mac on the VPN and lets you exclude apps. VPN Selectivo is for when you want, say, **only your torrent-based streaming app and one browser** on Mullvad, while your work apps, video calls and everything else stay on your regular connection.
 
-* ✅ **Only the chosen apps** use Mullvad — including every process they spawn (browser helpers, torrent engines such as Stremio's `node`, …).
-* ✅ **Fail-closed**: if the tunnel drops, protected apps lose connectivity instead of falling back to your normal connection. IPv6 and ICMP are blocked for them.
-* ✅ **Control window in the Dock**: VPN on/off switch, live status (server, real exit IP, which apps are being routed right now), location picker and an app list to check/uncheck. There is also a shield icon in the menu bar.
-* ✅ **Pick a country, city or server**, like in the official app (uses Mullvad's public relay list).
-* ✅ **Auto-VPN**, globally and per app (⚡): opening certain apps turns the VPN on, closing them turns it off.
-* ✅ **Check/uncheck apps instantly**, no password needed; each protected app also gets an "‹App› VPN" Dock launcher. If the app is already running, you are offered a clean restart so it moves into (or out of) the tunnel.
-* ✅ **Apps opened "the wrong way"** (original Dock icon, Spotlight, a link) are closed instantly and reopened protected.
-* ✅ **English and Spanish** interface, following your Mac's language.
-* ✅ Free, small and auditable; compiled on your Mac from verified upstream sources — no third-party binaries.
-
-> ⚠️ Personal project, not audited by a third party, and not affiliated with Mullvad, WireGuard or VPNonly. Read the [limitations](#honest-limitations) before trusting it with anything important.
->
-> 🌐 The app is available in **English and Spanish** and follows your Mac's language. To pick a language for this app only: System Settings › General › Language & Region › Applications › VPN Selectivo.
+* **Only the chosen apps** use Mullvad — including every process they spawn (browser helpers, torrent engines such as Stremio's `node`, …).
+* **Fail-closed**: if the tunnel drops, protected apps lose connectivity instead of falling back to your normal connection. IPv6 and ICMP are blocked for them.
+* **Control window in the Dock**: VPN on/off switch, live status (server, real exit IP, which apps are being routed right now), location picker and an app list to check/uncheck. There is also a shield icon in the menu bar.
+* **Pick a country, city or server**, like in the official app (uses Mullvad's public relay list).
+* **Auto-VPN**, globally and per app (⚡): opening certain apps turns the VPN on, closing them turns it off.
+* **Check/uncheck apps instantly**, no password needed; each protected app also gets an "‹App› VPN" Dock launcher. If the app is already running, you are offered a clean restart so it moves into (or out of) the tunnel.
+* **Apps opened "the wrong way"** (original Dock icon, Spotlight, a link) are closed instantly and reopened protected.
+* **English and Spanish** interface, following your Mac's language.
+* Free, small and auditable; compiled on your Mac from verified upstream sources — no third-party binaries.
 
 ---
 
@@ -27,7 +23,7 @@ The official Mullvad app for Mac does the opposite: it puts your **whole** Mac o
 * A Mac with **Apple Silicon**, macOS 13 or later (tested on macOS 26.5).
 * An active **Mullvad** account (uses 1 of your 5 devices).
 * Xcode **Command Line Tools**: `xcode-select --install`.
-* An internet connection to build (downloads Go and WireGuard sources, verified with SHA-256).
+
 
 ## Installation
 
