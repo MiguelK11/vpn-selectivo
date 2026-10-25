@@ -2,6 +2,8 @@
 
 **Reverse split tunneling for Mullvad on macOS: only the apps you choose go through the VPN — everything else keeps your normal connection.**
 
+> 🙏 **Built on the open-source engine of [VPNonly](https://github.com/kanishkdan/vpnonly)** by **Kanishk Razdan**. The core technique — launching apps under a dedicated Unix group, steering that group into a WireGuard tunnel with macOS PF `route-to`, and the `wireguard-go` NAT patch that makes this work with Mullvad — comes from his MIT-licensed work. VPN Selectivo is a small, free, Mullvad-focused companion around that engine. If you want a polished app with support and more providers, please check out and support **[VPNonly](https://vpnonly.app)**. Details in [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md).
+
 The official Mullvad app for Mac does the opposite: it puts your **whole** Mac on the VPN and lets you exclude apps. VPN Selectivo is for when you want, say, **only your torrent-based streaming app and one browser** on Mullvad, while your work apps, video calls and everything else stay on your regular connection.
 
 * ✅ **Only the chosen apps** use Mullvad — including every process they spawn (browser helpers, torrent engines such as Stremio's `node`, …).
@@ -173,7 +175,7 @@ Details, the audit of VPNonly's engine and all test results are in [docs/TECHNIC
 ## Credits and licenses
 
 * Own code: **MIT** (see [LICENSE](LICENSE)).
-* The `wireguard-go` NAT patch and the basis of `vpnrun.c` come from the MIT-licensed engine of **[VPNonly](https://github.com/kanishkdan/vpnonly)** © 2026 Kanishk Razdan. If you want a polished app with support and more providers, **VPNonly** is its author's commercial product.
+* **[VPNonly](https://github.com/kanishkdan/vpnonly)** © 2026 Kanishk Razdan (MIT): the per-app routing design (dedicated group + PF `route-to` + fail-closed block), the `wireguard-go` NAT patch (used unchanged) and the basis of `vpnrun.c`. See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md). If you want a polished app with support and more providers, **[VPNonly](https://vpnonly.app)** is its author's commercial product.
 * **wireguard-go** (MIT, WireGuard LLC) and **wireguard-tools `wg`** (GPL-2.0) are built from their official sources — no prebuilt binaries. See [third_party/NOTICES.md](third_party/NOTICES.md).
 * "WireGuard" is a registered trademark of Jason A. Donenfeld. "Mullvad" is a trademark of Mullvad VPN AB. This project is not affiliated with either.
 
